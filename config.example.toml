@@ -1,0 +1,18 @@
+decision_history = 100
+
+[strategy]
+minimum_edge_micros = 18000
+latency_haircut_micros = 2500
+order_size = 25
+taker_fee_rate_micros = 1000
+
+[risk]
+max_position = 250
+max_notional_micros = 100000000
+max_orders_per_minute = 60
+max_drawdown_micros = 15000000
+feed_stale_after_ms = 2500
+
+[paper]
+acknowledgement_delay_ns = 2000000
+taker_fee_rate_micros = 1000
