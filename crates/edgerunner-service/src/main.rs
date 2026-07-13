@@ -1,12 +1,11 @@
 mod config;
 mod server;
-mod simulation;
 
 use std::{path::PathBuf, time::Instant};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use edgerunner_core::{DislocationTaker, Engine, EventEnvelope, MarketEvent, Price, replay};
+use edgerunner_core::{DislocationTaker, Engine, replay, replay_with_limit};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::BackendConfig;
@@ -30,10 +29,10 @@ enum Command {
         journal: PathBuf,
         #[arg(long)]
         live_feeds: bool,
-        #[arg(long, default_value = "FIFA-WC-FRA-BRA")]
-        market: String,
-        #[arg(long, default_value = "")]
-        pascal_symbol: String,
+        #[arg(long)]
+        market: Option<String>,
+        #[arg(long)]
+        pascal_symbol: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -44,8 +43,12 @@ enum Command {
         config: Option<PathBuf>,
     },
     Bench {
-        #[arg(long, default_value_t = 100_000)]
-        iterations: u64,
+        /// A journal recorded by the live TxLINE and Pascal adapters.
+        #[arg(long)]
+        journal: PathBuf,
+        /// Limit the number of recorded events processed. `--iterations` remains an alias.
+        #[arg(long, visible_alias = "iterations")]
+        max_events: Option<u64>,
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -59,6 +62,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Local credentials are kept out of version control in `.env`; process variables still win.
+    let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| "edgerunner=info".into()),
@@ -68,9 +73,9 @@ async fn main() -> Result<()> {
     match Cli::parse().command.unwrap_or(Command::Serve {
         bind: "127.0.0.1:8080".into(),
         journal: "data/runs/latest.jsonl".into(),
-        live_feeds: false,
-        market: "FIFA-WC-FRA-BRA".into(),
-        pascal_symbol: String::new(),
+        live_feeds: true,
+        market: None,
+        pascal_symbol: None,
         config: None,
     }) {
         Command::Serve {
@@ -91,9 +96,11 @@ async fn main() -> Result<()> {
         Command::Replay { journal, config } => {
             run_replay(journal, BackendConfig::load(config.as_deref())?)
         }
-        Command::Bench { iterations, config } => {
-            run_bench(iterations, BackendConfig::load(config.as_deref())?)
-        }
+        Command::Bench {
+            journal,
+            max_events,
+            config,
+        } => run_bench(journal, max_events, BackendConfig::load(config.as_deref())?),
         Command::Probe { urls, samples } => run_probe(urls, samples).await,
     }
 }
@@ -112,42 +119,21 @@ fn run_replay(journal: PathBuf, config: BackendConfig) -> Result<()> {
     Ok(())
 }
 
-fn run_bench(iterations: u64, config: BackendConfig) -> Result<()> {
+fn run_bench(journal: PathBuf, max_events: Option<u64>, config: BackendConfig) -> Result<()> {
     let mut engine = engine(&config);
-    let market = "FIFA-WC-FRA-BRA".to_owned();
     let start = Instant::now();
-    for index in 1..=iterations {
-        let now = index * 100_000;
-        let fair = Price::from_micros(610_000 + (index as i64 % 7) * 1_000)?;
-        engine.process(EventEnvelope::new(
-            now,
-            MarketEvent::Book {
-                market: market.clone(),
-                bid: Price::from_micros(570_000)?,
-                bid_size: 100,
-                ask: Price::from_micros(580_000)?,
-                ask_size: 100,
-                venue_seq: index,
-            },
-        ));
-        engine.process(EventEnvelope::new(
-            now,
-            MarketEvent::FairValue {
-                market: market.clone(),
-                probability: fair,
-                source_seq: index,
-                message_id: None,
-                proof_ts: None,
-            },
-        ));
-    }
+    let report = replay_with_limit(&journal, &mut engine, max_events)
+        .map_err(|error| anyhow::anyhow!("benchmark failed: {error}"))?;
     let elapsed = start.elapsed();
     println!(
         "{}",
         serde_json::json!({
-            "events": iterations * 2,
+            "journal": journal,
+            "source": "recorded_txline_and_pascal",
+            "events": report.events,
             "elapsed_ms": elapsed.as_millis(),
-            "events_per_second": (iterations * 2) as f64 / elapsed.as_secs_f64(),
+            "events_per_second": report.events as f64 / elapsed.as_secs_f64(),
+            "replay": report,
             "decision_latency": engine.latency_snapshot()
         })
     );

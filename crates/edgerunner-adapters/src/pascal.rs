@@ -33,12 +33,7 @@ impl PascalBookAdapter {
         let mut asks = BTreeMap::new();
         write
             .send(Message::Text(
-                json!({
-                    "method": "subscribe",
-                    "params": {"channel": "book", "symbol": self.config.symbol}
-                })
-                .to_string()
-                .into(),
+                subscription_message(&self.config.symbol).into(),
             ))
             .await?;
 
@@ -48,7 +43,17 @@ impl PascalBookAdapter {
                 continue;
             }
             let payload: Value = serde_json::from_str(message.to_text()?)?;
+            if payload.get("type").and_then(Value::as_str) == Some("error") {
+                let message = payload
+                    .pointer("/data/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown Pascal subscription error");
+                bail!("Pascal subscription failed: {message}");
+            }
             if payload.get("channel").and_then(Value::as_str) != Some("book") {
+                continue;
+            }
+            if payload.get("symbol").and_then(Value::as_str) != Some(&self.config.symbol) {
                 continue;
             }
             let data = payload
@@ -66,6 +71,10 @@ impl PascalBookAdapter {
             let Some((&ask, &ask_size)) = asks.first_key_value() else {
                 continue;
             };
+            let Some(venue_seq) = parse_u64(payload.get("seq")) else {
+                tracing::warn!("dropping Pascal book update without a sequence number");
+                continue;
+            };
             sender
                 .send(EventEnvelope::new(
                     epoch_ns(),
@@ -75,13 +84,21 @@ impl PascalBookAdapter {
                         bid_size,
                         ask,
                         ask_size,
-                        venue_seq: parse_u64(payload.get("seq")).unwrap_or_default(),
+                        venue_seq,
                     },
                 ))
                 .await?;
         }
         bail!("Pascal websocket ended")
     }
+}
+
+fn subscription_message(symbol: &str) -> String {
+    json!({
+        "type": "subscribe",
+        "channels": [{"channel": "book", "symbol": symbol}]
+    })
+    .to_string()
 }
 
 fn apply_levels(book: &mut BTreeMap<Price, u64>, value: Option<&Value>) {
@@ -139,5 +156,13 @@ mod tests {
         assert_eq!(*book.first_key_value().unwrap().1, 15);
         apply_levels(&mut book, Some(&serde_json::json!([["0.540000", "0"]])));
         assert!(book.is_empty());
+    }
+
+    #[test]
+    fn uses_the_current_public_book_subscription_shape() {
+        let message: Value = serde_json::from_str(&subscription_message("MATCH.OUTCOME")).unwrap();
+        assert_eq!(message["type"], "subscribe");
+        assert_eq!(message["channels"][0]["channel"], "book");
+        assert_eq!(message["channels"][0]["symbol"], "MATCH.OUTCOME");
     }
 }

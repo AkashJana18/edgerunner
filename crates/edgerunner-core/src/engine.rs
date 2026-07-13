@@ -221,7 +221,7 @@ mod tests {
             DislocationTaker::new(DislocationConfig::default()),
             EngineConfig::default(),
         );
-        let market = "FIFA-WC-FRA-BRA".to_owned();
+        let market = "market-a".to_owned();
         engine.process(EventEnvelope::new(
             1_000_000,
             MarketEvent::Book {
@@ -256,7 +256,7 @@ mod tests {
             DislocationTaker::new(DislocationConfig::default()),
             EngineConfig::default(),
         );
-        let market = "FIFA-WC-FRA-BRA".to_owned();
+        let market = "market-a".to_owned();
         for (sequence, probability) in [(2, 610_000), (2, 300_000), (1, 200_000)] {
             engine.process(EventEnvelope::new(
                 sequence * 1_000,

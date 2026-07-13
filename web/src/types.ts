@@ -1,4 +1,5 @@
 export type FeedStatus = "connecting" | "live" | "stale" | "disconnected";
+export type FeedMode = "inactive" | "live";
 export type Side = "bid" | "ask";
 
 export interface MarketState {
@@ -69,4 +70,9 @@ export interface Snapshot {
   processed_events: number;
   rejected_orders: number;
   last_update: string;
+}
+
+export interface FeedModeState {
+  mode: FeedMode;
+  live_available: boolean;
 }

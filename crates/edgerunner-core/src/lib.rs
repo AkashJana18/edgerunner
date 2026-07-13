@@ -9,9 +9,9 @@ mod types;
 
 pub use engine::{Engine, EngineConfig, EngineOutput};
 pub use fixed::{Price, PriceError, SCALE};
-pub use journal::{JournalRecord, JournalWriter};
+pub use journal::{JournalRecord, JournalWriter, MarketDataSource};
 pub use paper::{ExecutionVenue, PaperConfig, PaperVenue};
-pub use replay::{ReplayReport, replay};
+pub use replay::{ReplayReport, replay, replay_with_limit};
 pub use risk::{RiskConfig, RiskDecision, RiskEngine};
 pub use strategy::{DislocationConfig, DislocationTaker, Strategy};
 pub use types::*;

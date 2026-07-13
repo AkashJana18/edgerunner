@@ -12,15 +12,18 @@ import {
   RefreshCw,
   ServerCog,
   ShieldCheck,
+  ToggleLeft,
+  ToggleRight,
   WifiOff,
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Decision, FeedStatus, MarketState, Snapshot } from "./types";
+import type { Decision, FeedMode, FeedModeState, FeedStatus, MarketState, Snapshot } from "./types";
 
 type LoadState = "loading" | "ready" | "error";
 
 const API = import.meta.env.VITE_API_BASE_URL ?? "";
+const CONTROL_TOKEN = import.meta.env.VITE_EDGERUNNER_CONTROL_TOKEN ?? "local-demo";
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -29,6 +32,8 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
   const [controlError, setControlError] = useState("");
+  const [feedMode, setFeedMode] = useState<FeedModeState | null>(null);
+  const [feedBusy, setFeedBusy] = useState(false);
   const [tab, setTab] = useState<"decisions" | "fills">("decisions");
   const [history, setHistory] = useState<number[]>([]);
 
@@ -36,10 +41,16 @@ function App() {
     setLoadState("loading");
     setError("");
     try {
-      const response = await fetch(`${API}/api/snapshot`);
-      if (!response.ok) throw new Error(`API returned ${response.status}`);
-      const data = (await response.json()) as Snapshot;
+      const [snapshotResponse, feedModeResponse] = await Promise.all([
+        fetch(`${API}/api/snapshot`),
+        fetch(`${API}/api/feed-mode`),
+      ]);
+      if (!snapshotResponse.ok) throw new Error(`API returned ${snapshotResponse.status}`);
+      if (!feedModeResponse.ok) throw new Error(`Feed source returned ${feedModeResponse.status}`);
+      const data = (await snapshotResponse.json()) as Snapshot;
+      const source = (await feedModeResponse.json()) as FeedModeState;
       setSnapshot(data);
+      setFeedMode(source);
       setLoadState("ready");
     } catch (cause) {
       setLoadState("error");
@@ -72,13 +83,38 @@ function App() {
     try {
       const response = await fetch(`${API}/api/${killed ? "kill" : "resume"}`, {
         method: "POST",
-        headers: { "x-api-token": "local-demo" },
+        headers: { "x-api-token": CONTROL_TOKEN },
       });
       if (!response.ok) throw new Error("Control request was rejected.");
     } catch (cause) {
       setControlError(cause instanceof Error ? cause.message : "Control request failed.");
     } finally {
       setControlBusy(false);
+    }
+  };
+
+  const setFeedSource = async (mode: FeedMode) => {
+    setFeedBusy(true);
+    setControlError("");
+    try {
+      const response = await fetch(`${API}/api/feed-mode`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-token": CONTROL_TOKEN,
+        },
+        body: JSON.stringify({ mode }),
+      });
+      const body = (await response.json().catch(() => null)) as FeedModeState | { error?: string } | null;
+      if (!response.ok) {
+        throw new Error(body && "error" in body ? body.error : "Feed source change was rejected.");
+      }
+      setFeedMode(body as FeedModeState);
+      setHistory([]);
+    } catch (cause) {
+      setControlError(cause instanceof Error ? cause.message : "Feed source change failed.");
+    } finally {
+      setFeedBusy(false);
     }
   };
 
@@ -91,7 +127,14 @@ function App() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       {!connected && <OfflineBanner />}
-      <Header snapshot={snapshot} busy={controlBusy} onControl={setKilled} />
+      <Header
+        snapshot={snapshot}
+        busy={controlBusy}
+        feedMode={feedMode}
+        feedBusy={feedBusy}
+        onControl={setKilled}
+        onFeedMode={setFeedSource}
+      />
       <main className="mx-auto w-full max-w-[1440px] px-4 py-5 md:px-6 lg:px-8">
         {controlError && (
           <div className="mb-4 flex items-center gap-2 border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger" role="alert">
@@ -99,7 +142,7 @@ function App() {
             {controlError}
           </div>
         )}
-        <StatusStrip snapshot={snapshot} market={market} />
+        <StatusStrip snapshot={snapshot} market={market} feedMode={feedMode} />
         <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1.5fr)_minmax(320px,0.75fr)]">
           <div className="min-w-0 space-y-5">
             <MarketPanel market={market} history={history} />
@@ -107,8 +150,8 @@ function App() {
           </div>
           <aside className="min-w-0 space-y-5">
             <LatencyPanel snapshot={snapshot} />
-            <RiskPanel snapshot={snapshot} market={market} />
-            <RunPanel snapshot={snapshot} />
+            <RiskPanel snapshot={snapshot} market={market} feedMode={feedMode} />
+            <RunPanel snapshot={snapshot} feedMode={feedMode} />
           </aside>
         </div>
       </main>
@@ -119,12 +162,20 @@ function App() {
 function Header({
   snapshot,
   busy,
+  feedMode,
+  feedBusy,
   onControl,
+  onFeedMode,
 }: {
   snapshot: Snapshot;
   busy: boolean;
+  feedMode: FeedModeState | null;
+  feedBusy: boolean;
   onControl: (killed: boolean) => Promise<void>;
+  onFeedMode: (mode: FeedMode) => Promise<void>;
 }) {
+  const live = feedMode?.mode === "live";
+  const feedSwitchDisabled = feedBusy || (!live && !feedMode?.live_available);
   return (
     <header className="border-b border-border bg-surface">
       <div className="mx-auto flex min-h-16 w-full max-w-[1440px] flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-6 lg:px-8">
@@ -141,6 +192,25 @@ function Header({
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 border border-border bg-background px-2 py-1.5">
+            <span className="text-xs text-secondary">TxLINE</span>
+            <button
+              type="button"
+              className={`feed-toggle ${live ? "feed-toggle-live" : ""}`}
+              role="switch"
+              aria-checked={live}
+              aria-label={live ? "Stop live feeds" : "Start live feeds"}
+              title={feedMode?.live_available ? (live ? "Stop live feeds" : "Start live feeds") : "Set server-side TxLINE and Pascal credentials to enable live data"}
+              disabled={feedSwitchDisabled}
+              aria-busy={feedBusy}
+              onClick={() => void onFeedMode(live ? "inactive" : "live")}
+            >
+              {live ? <ToggleRight size={22} aria-hidden="true" /> : <ToggleLeft size={22} aria-hidden="true" />}
+            </button>
+            <span className={`font-mono text-xs ${live ? "text-success" : "text-muted"}`}>
+              {feedBusy ? "SWITCHING" : live ? "LIVE" : feedMode?.live_available ? "OFF" : "SETUP"}
+            </span>
+          </div>
           <span className="hidden border border-border bg-background px-3 py-2 font-mono text-xs text-secondary sm:inline-flex">
             {snapshot.mode.toUpperCase()}
           </span>
@@ -160,9 +230,9 @@ function Header({
   );
 }
 
-function StatusStrip({ snapshot, market }: { snapshot: Snapshot; market?: MarketState }) {
+function StatusStrip({ snapshot, market, feedMode }: { snapshot: Snapshot; market?: MarketState; feedMode: FeedModeState | null }) {
   const metrics = [
-    { label: "Fair value", value: formatProbability(market?.fair_value), detail: "TxLINE", icon: DatabaseZap },
+    { label: "Fair value", value: formatProbability(market?.fair_value), detail: feedMode?.mode === "live" ? "TxLINE SSE" : "feeds inactive", icon: DatabaseZap },
     { label: "Best market", value: `${formatProbability(market?.best_bid)} / ${formatProbability(market?.best_ask)}`, detail: "bid / ask", icon: Activity },
     { label: "Position", value: `${market?.position ?? 0}`, detail: "contracts", icon: CircleGauge },
     { label: "Mark-to-market", value: formatMoney(market?.pnl_micros), detail: `${compact(snapshot.processed_events)} events`, icon: ServerCog },
@@ -194,7 +264,7 @@ function MarketPanel({ market, history }: { market?: MarketState; history: numbe
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Primary market</p>
-          <h2 id="market-heading" className="mt-1 text-base font-semibold">France vs Brazil</h2>
+          <h2 id="market-heading" className="mt-1 text-base font-semibold">{market.market}</h2>
         </div>
         <div className="text-right">
           <p className="font-mono text-sm font-semibold">{market.phase || "PRE"} {market.score_home}-{market.score_away}</p>
@@ -338,10 +408,12 @@ function LatencyPanel({ snapshot }: { snapshot: Snapshot }) {
   );
 }
 
-function RiskPanel({ snapshot, market }: { snapshot: Snapshot; market?: MarketState }) {
+function RiskPanel({ snapshot, market, feedMode }: { snapshot: Snapshot; market?: MarketState; feedMode: FeedModeState | null }) {
+  const liveFeeds = Object.values(snapshot.feed_status).every((status) => status === "live");
+  const inactive = feedMode?.mode === "inactive";
   const states = [
     { label: "Kill switch", ok: !snapshot.killed, text: snapshot.killed ? "ACTIVE" : "armed" },
-    { label: "Feed freshness", ok: Object.values(snapshot.feed_status).every((status) => status === "live"), text: "within limit" },
+    { label: "Feed freshness", ok: liveFeeds, text: inactive ? "inactive" : liveFeeds ? "within limit" : "unavailable" },
     { label: "Market circuit", ok: !market?.danger && !market?.suspended, text: market?.danger || market?.suspended ? "blocked" : "clear" },
     { label: "Position limit", ok: Math.abs(market?.position ?? 0) < 250, text: `${Math.abs(market?.position ?? 0)} / 250` },
   ];
@@ -365,13 +437,14 @@ function RiskPanel({ snapshot, market }: { snapshot: Snapshot; market?: MarketSt
   );
 }
 
-function RunPanel({ snapshot }: { snapshot: Snapshot }) {
+function RunPanel({ snapshot, feedMode }: { snapshot: Snapshot; feedMode: FeedModeState | null }) {
   return (
     <section className="panel" aria-labelledby="run-heading">
       <div className="panel-heading"><div><p className="eyebrow">Runtime</p><h2 id="run-heading" className="mt-1 text-base font-semibold">Run identity</h2></div><ServerCog size={18} className="text-secondary" aria-hidden="true" /></div>
       <dl className="grid grid-cols-[92px_1fr] gap-x-3 gap-y-3 p-4 text-xs md:p-5">
         <dt className="text-muted">Run ID</dt><dd className="truncate font-mono" title={snapshot.run_id}>{snapshot.run_id}</dd>
         <dt className="text-muted">Mode</dt><dd className="font-mono uppercase">{snapshot.mode}</dd>
+        <dt className="text-muted">Source</dt><dd className={`font-mono uppercase ${feedMode?.mode === "live" ? "text-success" : "text-secondary"}`}>{feedMode?.mode ?? "unknown"}</dd>
         <dt className="text-muted">Events</dt><dd className="font-mono">{snapshot.processed_events.toLocaleString()}</dd>
         <dt className="text-muted">Rejected</dt><dd className="font-mono">{snapshot.rejected_orders.toLocaleString()}</dd>
         <dt className="text-muted">TxLINE</dt><dd><FeedBadge status={snapshot.feed_status.txline} /></dd>
@@ -416,7 +489,7 @@ function ErrorView({ message, onRetry }: { message: string; onRetry: () => void 
 }
 
 function OfflineBanner() {
-  return <div className="flex min-h-10 items-center justify-center gap-2 bg-warning px-4 py-2 text-center text-xs font-medium text-warning-foreground" role="status"><WifiOff size={15} aria-hidden="true" />Live stream reconnecting. Last confirmed state remains visible.</div>;
+  return <div className="flex min-h-10 items-center justify-center gap-2 bg-warning px-4 py-2 text-center text-xs font-medium text-warning-foreground" role="status"><WifiOff size={15} aria-hidden="true" />Dashboard stream reconnecting. Last confirmed state remains visible.</div>;
 }
 
 function EmptyPanel({ title, detail, inline = false }: { title: string; detail: string; inline?: boolean }) {

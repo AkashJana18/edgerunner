@@ -9,6 +9,7 @@ anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
+dotenvy.workspace = true
 edgerunner-adapters = { path = "../edgerunner-adapters" }
 edgerunner-core = { path = "../edgerunner-core" }
 futures-util.workspace = true

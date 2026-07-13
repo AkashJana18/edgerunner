@@ -37,6 +37,10 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--color-accent); 
 .control-button-resume { background: var(--color-success); color: #0d2115; }
 .secondary-button { border-color: var(--color-border); background: var(--color-surface-raised); color: var(--color-foreground); }
 .secondary-button:hover { border-color: var(--color-muted); }
+.feed-toggle { display: grid; min-width: 40px; min-height: 40px; place-items: center; color: var(--color-muted); transition: color 150ms ease; }
+.feed-toggle:hover:not(:disabled) { color: var(--color-foreground); }
+.feed-toggle:disabled { cursor: not-allowed; opacity: 0.45; }
+.feed-toggle-live { color: var(--color-success); }
 .price-bar { min-width: 3px; flex: 1 1 0%; background: var(--color-accent); opacity: 0.72; }
 .data-block { display: flex; min-width: 0; flex-direction: column; gap: 6px; border: 1px solid var(--color-border); padding: 8px; color: var(--color-muted); }
 .data-block strong { overflow: hidden; color: var(--color-foreground); font-family: var(--font-mono); text-overflow: ellipsis; }
@@ -73,4 +77,3 @@ tbody tr:hover { background: var(--color-surface-raised); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
-

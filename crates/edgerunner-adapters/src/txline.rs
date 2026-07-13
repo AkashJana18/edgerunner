@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TxLineConfig {
     pub origin: String,
-    pub guest_jwt: String,
     pub api_token: String,
     pub market: String,
+    pub fixture_id: u64,
 }
 
 pub struct TxLineAdapter {
@@ -22,21 +22,22 @@ pub struct TxLineAdapter {
 pub struct TxLineProofClient {
     client: reqwest::Client,
     origin: String,
+    api_token: String,
 }
 
 impl TxLineAdapter {
     pub fn new(config: TxLineConfig) -> Result<Self> {
-        let client = authenticated_client(&config)?;
+        let client = api_token_client(&config.api_token)?;
         Ok(Self { client, config })
     }
 
     pub async fn stream_odds(self, sender: mpsc::Sender<EventEnvelope>) -> Result<()> {
+        let client = data_client(&self.client, &self.config.origin, &self.config.api_token).await?;
         let url = format!(
             "{}/api/odds/stream",
             self.config.origin.trim_end_matches('/')
         );
-        let response = self
-            .client
+        let response = client
             .get(url)
             .header(ACCEPT, "text/event-stream")
             .header(CACHE_CONTROL, "no-cache")
@@ -63,7 +64,21 @@ impl TxLineAdapter {
                 }
                 let payload: Value =
                     serde_json::from_str(&data).context("invalid TxLINE SSE JSON")?;
+                if !matches_fixture(&payload, self.config.fixture_id) {
+                    continue;
+                }
                 if let Some(probability) = extract_probability(&payload) {
+                    let message_id =
+                        extract_string(&payload, &["messageId", "MessageId", "message_id"])
+                            .filter(|value| !value.trim().is_empty());
+                    let proof_ts = extract_i64(&payload, &["ts", "Ts"]);
+                    let (Some(message_id), Some(proof_ts)) = (message_id, proof_ts) else {
+                        tracing::warn!(
+                            fixture_id = self.config.fixture_id,
+                            "dropping TxLINE update without message provenance"
+                        );
+                        continue;
+                    };
                     sequence += 1;
                     sender
                         .send(EventEnvelope::new(
@@ -73,11 +88,8 @@ impl TxLineAdapter {
                                 probability,
                                 source_seq: extract_u64(&payload, &["seq", "Seq"])
                                     .unwrap_or(sequence),
-                                message_id: extract_string(
-                                    &payload,
-                                    &["messageId", "MessageId", "message_id"],
-                                ),
-                                proof_ts: extract_i64(&payload, &["ts", "Ts"]),
+                                message_id: Some(message_id),
+                                proof_ts: Some(proof_ts),
                             },
                         ))
                         .await
@@ -92,15 +104,16 @@ impl TxLineAdapter {
 impl TxLineProofClient {
     pub fn new(config: &TxLineConfig) -> Result<Self> {
         Ok(Self {
-            client: authenticated_client(config)?,
+            client: api_token_client(&config.api_token)?,
             origin: config.origin.clone(),
+            api_token: config.api_token.clone(),
         })
     }
 
     pub async fn fetch_odds_proof(&self, message_id: &str, ts: i64) -> Result<Value> {
+        let client = data_client(&self.client, &self.origin, &self.api_token).await?;
         let url = format!("{}/api/odds/validation", self.origin.trim_end_matches('/'));
-        Ok(self
-            .client
+        Ok(client
             .get(url)
             .query(&[("messageId", message_id), ("ts", &ts.to_string())])
             .send()
@@ -111,17 +124,43 @@ impl TxLineProofClient {
     }
 }
 
-fn authenticated_client(config: &TxLineConfig) -> Result<reqwest::Client> {
+fn api_token_client(api_token: &str) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", config.guest_jwt))?,
-    );
-    headers.insert("x-api-token", HeaderValue::from_str(&config.api_token)?);
+    headers.insert("x-api-token", HeaderValue::from_str(api_token)?);
     Ok(reqwest::Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
         .build()?)
+}
+
+async fn data_client(
+    client: &reqwest::Client,
+    origin: &str,
+    api_token: &str,
+) -> Result<reqwest::Client> {
+    let jwt = client
+        .post(format!("{}/auth/guest/start", origin.trim_end_matches('/')))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GuestAuthResponse>()
+        .await?
+        .token;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {jwt}"))?,
+    );
+    headers.insert("x-api-token", HeaderValue::from_str(api_token)?);
+    Ok(reqwest::Client::builder()
+        .default_headers(headers)
+        .tcp_nodelay(true)
+        .build()?)
+}
+
+#[derive(Deserialize)]
+struct GuestAuthResponse {
+    token: String,
 }
 
 fn find_sse_separator(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -163,6 +202,14 @@ fn extract_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     })
 }
 
+fn matches_fixture(value: &Value, fixture_id: u64) -> bool {
+    extract_u64(
+        value,
+        &["fixtureId", "FixtureId", "FixtureID", "fixture_id"],
+    )
+    .is_some_and(|value| value == fixture_id)
+}
+
 fn extract_i64(value: &Value, keys: &[&str]) -> Option<i64> {
     keys.iter().find_map(|key| {
         let value = find_key(value, key)?;
@@ -202,6 +249,13 @@ mod tests {
     fn extracts_nested_stable_price() {
         let value = serde_json::json!({"data": {"StablePrice": "0.617500"}});
         assert_eq!(extract_probability(&value).unwrap().micros(), 617_500);
+    }
+
+    #[test]
+    fn keeps_only_the_configured_fixture() {
+        let value = serde_json::json!({"data": {"FixtureId": 17588320}});
+        assert!(matches_fixture(&value, 17_588_320));
+        assert!(!matches_fixture(&value, 17_588_321));
     }
 
     #[test]

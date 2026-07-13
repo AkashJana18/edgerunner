@@ -7,6 +7,13 @@ use uuid::Uuid;
 
 use crate::{DecisionRecord, EventEnvelope, Fill};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketDataSource {
+    Txline,
+    Pascal,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum JournalRecord {
@@ -17,6 +24,8 @@ pub enum JournalRecord {
     },
     Event {
         schema: u16,
+        /// The live adapter that produced this event. This is mandatory for replay.
+        source: MarketDataSource,
         event: EventEnvelope,
     },
     Decision {

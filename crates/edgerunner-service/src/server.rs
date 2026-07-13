@@ -1,10 +1,6 @@
 use std::{
-    collections::BTreeMap,
-    convert::Infallible,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::BTreeMap, convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -19,11 +15,15 @@ use edgerunner_adapters::{
     PascalBookAdapter, PascalConfig, TxLineAdapter, TxLineConfig, TxLineProofClient,
 };
 use edgerunner_core::{
-    DislocationTaker, Engine, EngineSnapshot, FeedStatus, JournalRecord, JournalWriter, OrderMode,
+    DislocationTaker, Engine, EngineSnapshot, FeedStatus, JournalRecord, JournalWriter,
+    MarketDataSource, OrderMode,
 };
 use futures_util::Stream;
-use serde::Serialize;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::{Mutex, RwLock, broadcast, mpsc},
+    task::JoinHandle,
+};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -31,14 +31,13 @@ use tower_http::{
 };
 
 use crate::config::BackendConfig;
-use crate::simulation;
-
 type TradingEngine = Engine<DislocationTaker>;
 
 struct Runtime {
     engine: TradingEngine,
     running: bool,
     killed: bool,
+    feed_mode: FeedMode,
     feed_status: BTreeMap<String, FeedStatus>,
 }
 
@@ -53,8 +52,109 @@ impl Runtime {
 struct AppState {
     runtime: Arc<RwLock<Runtime>>,
     snapshots: broadcast::Sender<EngineSnapshot>,
+    journal: mpsc::Sender<JournalRecord>,
+    feeds: Arc<Mutex<FeedController>>,
     control_token: Arc<String>,
     config: BackendConfig,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FeedMode {
+    Inactive,
+    Live,
+}
+
+struct FeedController {
+    mode: FeedMode,
+    live: Option<ConfiguredLiveFeed>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct ConfiguredLiveFeed {
+    market: String,
+    pascal_symbol: String,
+    fixture_id: u64,
+    txline_origin: String,
+    api_token: String,
+    pascal_ws: String,
+}
+
+impl ConfiguredLiveFeed {
+    fn from_environment(market: Option<String>, pascal_symbol: Option<String>) -> Result<Self> {
+        let market = market
+            .or_else(|| optional_env("TXLINE_MARKET"))
+            .context("TXLINE_MARKET is required for live feeds")?;
+        let pascal_symbol = pascal_symbol
+            .or_else(|| optional_env("PASCAL_SYMBOL"))
+            .context("PASCAL_SYMBOL is required for live feeds")?;
+        let fixture_id = required_env("TXLINE_FIXTURE_ID")?
+            .parse()
+            .context("TXLINE_FIXTURE_ID must be an unsigned integer")?;
+        let api_token = required_env("TXLINE_API_TOKEN")?;
+        let config = Self {
+            market,
+            pascal_symbol,
+            fixture_id,
+            txline_origin: std::env::var("TXLINE_ORIGIN")
+                .unwrap_or_else(|_| "https://txline-dev.txodds.com".into()),
+            api_token,
+            pascal_ws: std::env::var("PASCAL_WS_URL")
+                .unwrap_or_else(|_| "wss://data.pascal.trade/ws".into()),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn optional_from_environment() -> Result<Option<Self>> {
+        let keys = [
+            "TXLINE_API_TOKEN",
+            "TXLINE_MARKET",
+            "PASCAL_SYMBOL",
+            "TXLINE_FIXTURE_ID",
+        ];
+        let configured = keys
+            .iter()
+            .filter(|key| optional_env(key).is_some())
+            .count();
+        if configured == 0 {
+            return Ok(None);
+        }
+        Self::from_environment(None, None).map(Some)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.pascal_symbol.trim().is_empty() {
+            anyhow::bail!("PASCAL_SYMBOL cannot be empty");
+        }
+        if !self.pascal_ws.starts_with("ws://") && !self.pascal_ws.starts_with("wss://") {
+            anyhow::bail!("PASCAL_WS_URL must use ws:// or wss://");
+        }
+        TxLineAdapter::new(TxLineConfig {
+            origin: self.txline_origin.clone(),
+            api_token: self.api_token.clone(),
+            market: self.market.clone(),
+            fixture_id: self.fixture_id,
+        })?;
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct SetFeedMode {
+    mode: FeedMode,
+}
+
+#[derive(Serialize)]
+struct FeedModeState {
+    mode: FeedMode,
+    live_available: bool,
+}
+
+#[derive(Serialize)]
+struct ApiError {
+    error: String,
 }
 
 #[derive(Serialize)]
@@ -70,8 +170,8 @@ struct Readiness {
 }
 
 pub struct LiveFeedConfig {
-    pub market: String,
-    pub pascal_symbol: String,
+    pub market: Option<String>,
+    pub pascal_symbol: Option<String>,
 }
 
 struct ProofRequest {
@@ -89,14 +189,18 @@ pub async fn serve(
     let address: SocketAddr = bind.parse().context("invalid bind address")?;
     let configured_control_token = std::env::var("EDGERUNNER_CONTROL_TOKEN").ok();
     let control_token = resolve_control_token(address, configured_control_token)?;
-    let mut feed_status = BTreeMap::new();
-    let initial_status = if live.is_some() {
-        FeedStatus::Connecting
-    } else {
-        FeedStatus::Live
+    let live = match live {
+        Some(config) => Some(ConfiguredLiveFeed::from_environment(
+            config.market,
+            config.pascal_symbol,
+        )?),
+        None => ConfiguredLiveFeed::optional_from_environment()?,
     };
-    feed_status.insert("txline".into(), initial_status);
-    feed_status.insert("pascal".into(), initial_status);
+    let initial_mode = if live.is_some() {
+        FeedMode::Live
+    } else {
+        FeedMode::Inactive
+    };
     let runtime = Arc::new(RwLock::new(Runtime {
         engine: Engine::new(
             DislocationTaker::new(config.strategy.clone()),
@@ -104,28 +208,35 @@ pub async fn serve(
         ),
         running: true,
         killed: false,
-        feed_status,
+        feed_mode: initial_mode,
+        feed_status: feed_status_for(initial_mode),
     }));
     let (snapshots, _) = broadcast::channel(128);
     let (journal_tx, journal_rx) = mpsc::channel(4096);
     spawn_journal(journal_path, journal_rx);
     journal_tx
         .send(JournalRecord::Run {
-            schema: 1,
+            schema: 2,
             run_id: runtime.read().await.engine.run_id,
             started_at: chrono::Utc::now(),
         })
         .await
         .context("journal worker stopped during startup")?;
-    if let Some(live) = live {
-        spawn_live_feeds(runtime.clone(), snapshots.clone(), journal_tx, live)?;
+    let workers = if let Some(live) = live.clone() {
+        spawn_live_feeds(runtime.clone(), snapshots.clone(), journal_tx.clone(), live)?
     } else {
-        spawn_simulator(runtime.clone(), snapshots.clone(), journal_tx);
-    }
+        Vec::new()
+    };
 
     let state = AppState {
         runtime,
         snapshots,
+        journal: journal_tx,
+        feeds: Arc::new(Mutex::new(FeedController {
+            mode: initial_mode,
+            live,
+            workers,
+        })),
         control_token: Arc::new(control_token),
         config,
     };
@@ -136,6 +247,7 @@ pub async fn serve(
         .route("/api/snapshot", get(snapshot))
         .route("/api/events", get(events))
         .route("/api/metrics", get(metrics))
+        .route("/api/feed-mode", get(feed_mode).post(set_feed_mode))
         .route("/api/kill", post(kill))
         .route("/api/resume", post(resume))
         .with_state(state)
@@ -179,6 +291,14 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
                 reason: "kill switch active",
             },
         )
+    } else if runtime.feed_mode == FeedMode::Inactive {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Readiness {
+                ready: false,
+                reason: "live feeds inactive",
+            },
+        )
     } else if !feeds_live {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -205,6 +325,40 @@ async fn effective_config(State(state): State<AppState>) -> Json<BackendConfig> 
 
 async fn snapshot(State(state): State<AppState>) -> Json<EngineSnapshot> {
     Json(state.runtime.read().await.snapshot())
+}
+
+async fn feed_mode(State(state): State<AppState>) -> Json<FeedModeState> {
+    let controller = state.feeds.lock().await;
+    Json(FeedModeState {
+        mode: controller.mode,
+        live_available: controller.live.is_some(),
+    })
+}
+
+async fn set_feed_mode(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SetFeedMode>,
+) -> Result<Json<FeedModeState>, (StatusCode, Json<ApiError>)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "control token rejected".into(),
+            }),
+        ));
+    }
+    switch_feed_mode(&state, request.mode)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: error.to_string(),
+                }),
+            )
+        })
 }
 
 async fn events(
@@ -300,78 +454,28 @@ fn spawn_journal(path: PathBuf, mut receiver: mpsc::Receiver<JournalRecord>) {
     });
 }
 
-fn spawn_simulator(
-    runtime: Arc<RwLock<Runtime>>,
-    snapshots: broadcast::Sender<EngineSnapshot>,
-    journal: mpsc::Sender<JournalRecord>,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(350));
-        let mut tick = 0_u64;
-        loop {
-            interval.tick().await;
-            tick += 1;
-            let now = epoch_ns();
-            for event in simulation::events(tick, now) {
-                let _ = journal
-                    .send(JournalRecord::Event {
-                        schema: 1,
-                        event: event.clone(),
-                    })
-                    .await;
-                let (records, snapshot) = {
-                    let mut guard = runtime.write().await;
-                    let mut records = Vec::new();
-                    for output in guard.engine.process(event) {
-                        records.push(JournalRecord::Decision {
-                            schema: 1,
-                            decision: output.decision,
-                        });
-                        if let Some(fill) = output.fill {
-                            records.push(JournalRecord::Fill { schema: 1, fill });
-                        }
-                    }
-                    (records, guard.snapshot())
-                };
-                for record in records {
-                    let _ = journal.send(record).await;
-                }
-                let _ = snapshots.send(snapshot);
-            }
-        }
-    });
-}
-
 fn spawn_live_feeds(
     runtime: Arc<RwLock<Runtime>>,
     snapshots: broadcast::Sender<EngineSnapshot>,
     journal: mpsc::Sender<JournalRecord>,
-    live: LiveFeedConfig,
-) -> Result<()> {
-    if live.pascal_symbol.is_empty() {
-        anyhow::bail!("--pascal-symbol is required with --live-feeds");
-    }
-    let guest_jwt = std::env::var("TXLINE_GUEST_JWT").context("TXLINE_GUEST_JWT is required")?;
-    let api_token = std::env::var("TXLINE_API_TOKEN").context("TXLINE_API_TOKEN is required")?;
-    let txline_origin =
-        std::env::var("TXLINE_ORIGIN").unwrap_or_else(|_| "https://txline.txodds.com".into());
-    let pascal_ws =
-        std::env::var("PASCAL_WS_URL").unwrap_or_else(|_| "wss://ws.pascal.trade".into());
+    live: ConfiguredLiveFeed,
+) -> Result<Vec<JoinHandle<()>>> {
+    live.validate()?;
     let (sender, mut receiver) = mpsc::channel(4096);
 
     let txline_config = TxLineConfig {
-        origin: txline_origin,
-        guest_jwt,
-        api_token,
+        origin: live.txline_origin,
+        api_token: live.api_token,
         market: live.market.clone(),
+        fixture_id: live.fixture_id,
     };
     let proof_client = TxLineProofClient::new(&txline_config)?;
     let (proof_sender, proof_receiver) = mpsc::channel(512);
-    spawn_proof_worker(proof_client, journal.clone(), proof_receiver);
+    let proof_worker = spawn_proof_worker(proof_client, journal.clone(), proof_receiver);
     let txline_sender = sender.clone();
     let txline_runtime = runtime.clone();
     let txline_snapshots = snapshots.clone();
-    tokio::spawn(async move {
+    let txline_worker = tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         loop {
             set_feed_status(
@@ -401,13 +505,13 @@ fn spawn_live_feeds(
     });
 
     let pascal_config = PascalConfig {
-        ws_url: pascal_ws,
+        ws_url: live.pascal_ws,
         symbol: live.pascal_symbol,
         market: live.market,
     };
     let pascal_runtime = runtime.clone();
     let pascal_snapshots = snapshots.clone();
-    tokio::spawn(async move {
+    let pascal_worker = tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         loop {
             set_feed_status(
@@ -435,24 +539,28 @@ fn spawn_live_feeds(
         }
     });
 
-    tokio::spawn(async move {
+    let event_worker = tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {
-            let feed = match event.event {
-                edgerunner_core::MarketEvent::FairValue { .. } => Some("txline"),
-                edgerunner_core::MarketEvent::Book { .. } => Some("pascal"),
-                _ => None,
+            let (feed, source) = match &event.event {
+                edgerunner_core::MarketEvent::FairValue { .. } => {
+                    ("txline", MarketDataSource::Txline)
+                }
+                edgerunner_core::MarketEvent::Book { .. } => ("pascal", MarketDataSource::Pascal),
+                _ => {
+                    tracing::warn!("dropping market event without a configured live source");
+                    continue;
+                }
             };
             let _ = journal
                 .send(JournalRecord::Event {
-                    schema: 1,
+                    schema: 2,
+                    source,
                     event: event.clone(),
                 })
                 .await;
             let (records, proof_requests, snapshot) = {
                 let mut guard = runtime.write().await;
-                if let Some(feed) = feed {
-                    guard.feed_status.insert(feed.into(), FeedStatus::Live);
-                }
+                guard.feed_status.insert(feed.into(), FeedStatus::Live);
                 let mut records = Vec::new();
                 let mut proof_requests = Vec::new();
                 for output in guard.engine.process(event) {
@@ -468,11 +576,11 @@ fn spawn_live_feeds(
                         });
                     }
                     records.push(JournalRecord::Decision {
-                        schema: 1,
+                        schema: 2,
                         decision: output.decision,
                     });
                     if let Some(fill) = output.fill {
-                        records.push(JournalRecord::Fill { schema: 1, fill });
+                        records.push(JournalRecord::Fill { schema: 2, fill });
                     }
                 }
                 (records, proof_requests, guard.snapshot())
@@ -486,14 +594,19 @@ fn spawn_live_feeds(
             let _ = snapshots.send(snapshot);
         }
     });
-    Ok(())
+    Ok(vec![
+        proof_worker,
+        txline_worker,
+        pascal_worker,
+        event_worker,
+    ])
 }
 
 fn spawn_proof_worker(
     client: TxLineProofClient,
     journal: mpsc::Sender<JournalRecord>,
     mut receiver: mpsc::Receiver<ProofRequest>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         const RETRY_DELAYS: [Duration; 6] = [
             Duration::from_secs(0),
@@ -514,7 +627,7 @@ fn spawn_proof_worker(
                     Ok(proof) => {
                         let _ = journal
                             .send(JournalRecord::Proof {
-                                schema: 1,
+                                schema: 2,
                                 order_id: request.order_id,
                                 message_id: request.message_id.clone(),
                                 proof_ts: request.proof_ts,
@@ -537,7 +650,100 @@ fn spawn_proof_worker(
                 );
             }
         }
-    });
+    })
+}
+
+async fn switch_feed_mode(state: &AppState, mode: FeedMode) -> Result<FeedModeState> {
+    let mut controller = state.feeds.lock().await;
+    if controller.mode == mode {
+        return Ok(FeedModeState {
+            mode,
+            live_available: controller.live.is_some(),
+        });
+    }
+
+    let live = match mode {
+        FeedMode::Inactive => None,
+        FeedMode::Live => Some(
+            controller
+                .live
+                .clone()
+                .context("live feeds are not configured on this server")?,
+        ),
+    };
+    if let Some(live) = &live {
+        live.validate()?;
+    }
+
+    for worker in controller.workers.drain(..) {
+        worker.abort();
+    }
+    let (run_record, snapshot) = reset_runtime(&state.runtime, &state.config, mode).await;
+    state
+        .journal
+        .send(run_record)
+        .await
+        .context("journal worker stopped during feed switch")?;
+    let _ = state.snapshots.send(snapshot);
+
+    controller.workers = match live {
+        Some(live) => spawn_live_feeds(
+            state.runtime.clone(),
+            state.snapshots.clone(),
+            state.journal.clone(),
+            live,
+        )?,
+        None => Vec::new(),
+    };
+    controller.mode = mode;
+    Ok(FeedModeState {
+        mode,
+        live_available: controller.live.is_some(),
+    })
+}
+
+async fn reset_runtime(
+    runtime: &Arc<RwLock<Runtime>>,
+    config: &BackendConfig,
+    feed_mode: FeedMode,
+) -> (JournalRecord, EngineSnapshot) {
+    let mut runtime = runtime.write().await;
+    let killed = runtime.killed;
+    runtime.engine = Engine::new(
+        DislocationTaker::new(config.strategy.clone()),
+        config.engine(),
+    );
+    runtime.engine.set_killed(killed);
+    runtime.feed_mode = feed_mode;
+    runtime.feed_status = feed_status_for(feed_mode);
+    let run_id = runtime.engine.run_id;
+    let snapshot = runtime.snapshot();
+    (
+        JournalRecord::Run {
+            schema: 2,
+            run_id,
+            started_at: chrono::Utc::now(),
+        },
+        snapshot,
+    )
+}
+
+fn feed_status_for(mode: FeedMode) -> BTreeMap<String, FeedStatus> {
+    let status = match mode {
+        FeedMode::Inactive => FeedStatus::Disconnected,
+        FeedMode::Live => FeedStatus::Connecting,
+    };
+    BTreeMap::from([("txline".to_owned(), status), ("pascal".to_owned(), status)])
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn required_env(key: &str) -> Result<String> {
+    optional_env(key).with_context(|| format!("{key} is required for live feeds"))
 }
 
 async fn set_feed_status(
@@ -552,14 +758,6 @@ async fn set_feed_status(
         guard.snapshot()
     };
     let _ = snapshots.send(snapshot);
-}
-
-fn epoch_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
 }
 
 fn resolve_control_token(address: SocketAddr, configured: Option<String>) -> Result<String> {
@@ -583,5 +781,20 @@ mod tests {
             "secret"
         );
         assert_eq!(resolve_control_token(local, None).unwrap(), "local-demo");
+    }
+
+    #[test]
+    fn source_statuses_do_not_present_inactive_feeds_as_live() {
+        let inactive = feed_status_for(FeedMode::Inactive);
+        let live = feed_status_for(FeedMode::Live);
+        assert!(
+            inactive
+                .values()
+                .all(|status| *status == FeedStatus::Disconnected)
+        );
+        assert!(
+            live.values()
+                .all(|status| *status == FeedStatus::Connecting)
+        );
     }
 }
