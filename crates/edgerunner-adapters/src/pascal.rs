@@ -15,8 +15,23 @@ pub struct PascalConfig {
     pub market: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PascalMarket {
+    pub symbol: String,
+    pub event_description: String,
+    pub market_description: String,
+    pub market_period: String,
+    pub expected_event_start_time_ms: Option<u64>,
+    pub tags: Vec<String>,
+}
+
 pub struct PascalBookAdapter {
     config: PascalConfig,
+}
+
+pub struct PascalMarketClient {
+    client: reqwest::Client,
+    read_base_url: String,
 }
 
 impl PascalBookAdapter {
@@ -93,12 +108,86 @@ impl PascalBookAdapter {
     }
 }
 
+impl PascalMarketClient {
+    pub fn from_ws_url(ws_url: &str) -> Result<Self> {
+        let read_base_url = read_base_url(ws_url)?;
+        Ok(Self {
+            client: reqwest::Client::builder().tcp_nodelay(true).build()?,
+            read_base_url,
+        })
+    }
+
+    pub async fn list_markets(&self) -> Result<Vec<PascalMarket>> {
+        let payload: Value = self
+            .client
+            .get(format!("{}/api/v1/markets", self.read_base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let markets = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .context("Pascal market response missing data array")?
+            .iter()
+            .filter_map(parse_market)
+            .collect();
+        Ok(markets)
+    }
+}
+
 fn subscription_message(symbol: &str) -> String {
     json!({
         "type": "subscribe",
         "channels": [{"channel": "book", "symbol": symbol}]
     })
     .to_string()
+}
+
+fn read_base_url(ws_url: &str) -> Result<String> {
+    let (scheme, remainder) = if let Some(value) = ws_url.strip_prefix("wss://") {
+        ("https", value)
+    } else if let Some(value) = ws_url.strip_prefix("ws://") {
+        ("http", value)
+    } else {
+        bail!("Pascal websocket URL must use ws:// or wss://");
+    };
+    let host = remainder.split('/').next().unwrap_or_default();
+    if host.is_empty() {
+        bail!("Pascal websocket URL is missing a host");
+    }
+    Ok(format!("{scheme}://{host}"))
+}
+
+fn parse_market(value: &Value) -> Option<PascalMarket> {
+    let attributes = value.get("display_attributes")?;
+    Some(PascalMarket {
+        symbol: value.get("symbol")?.as_str()?.to_owned(),
+        event_description: attributes.get("event_description")?.as_str()?.to_owned(),
+        market_description: attributes
+            .get("market_description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        market_period: attributes
+            .pointer("/game_page/section_description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        expected_event_start_time_ms: parse_u64(attributes.get("expected_event_start_time_ms")),
+        tags: attributes
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
 }
 
 fn apply_levels(book: &mut BTreeMap<Price, u64>, value: Option<&Value>) {
@@ -164,5 +253,31 @@ mod tests {
         assert_eq!(message["type"], "subscribe");
         assert_eq!(message["channels"][0]["channel"], "book");
         assert_eq!(message["channels"][0]["symbol"], "MATCH.OUTCOME");
+    }
+
+    #[test]
+    fn derives_the_public_read_api_from_the_websocket_url() {
+        assert_eq!(
+            read_base_url("wss://data.pascal.trade/ws").unwrap(),
+            "https://data.pascal.trade"
+        );
+    }
+
+    #[test]
+    fn parses_public_market_metadata() {
+        let market = parse_market(&serde_json::json!({
+            "symbol": "MATCH.HOME",
+            "display_attributes": {
+                "event_description": "Home vs Away",
+                "market_description": "Home win",
+                "game_page": {"section_description": "Moneyline - Reg Time"},
+                "expected_event_start_time_ms": "1784055600000",
+                "tags": ["Sports"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(market.symbol, "MATCH.HOME");
+        assert_eq!(market.market_period, "Moneyline - Reg Time");
+        assert_eq!(market.expected_event_start_time_ms, Some(1_784_055_600_000));
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use edgerunner_core::{EventEnvelope, MarketEvent, Price};
+use edgerunner_core::{EventEnvelope, MarketEvent, Price, TxLineMarketSelection};
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,25 @@ pub struct TxLineConfig {
     pub api_token: String,
     pub market: String,
     pub fixture_id: u64,
+    pub selection: TxLineMarketSelection,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TxLineFixture {
+    pub fixture_id: u64,
+    pub participant_1: String,
+    pub participant_2: String,
+    pub participant_1_is_home: bool,
+    pub start_time_ms: u64,
+    pub game_state: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TxLineOddsLine {
+    pub super_odds_type: String,
+    pub market_parameters: String,
+    pub market_period: String,
+    pub price_names: Vec<String>,
 }
 
 pub struct TxLineAdapter {
@@ -20,6 +39,12 @@ pub struct TxLineAdapter {
 }
 
 pub struct TxLineProofClient {
+    client: reqwest::Client,
+    origin: String,
+    api_token: String,
+}
+
+pub struct TxLineDiscoveryClient {
     client: reqwest::Client,
     origin: String,
     api_token: String,
@@ -39,6 +64,7 @@ impl TxLineAdapter {
         );
         let response = client
             .get(url)
+            .query(&[("fixtureId", self.config.fixture_id)])
             .header(ACCEPT, "text/event-stream")
             .header(CACHE_CONTROL, "no-cache")
             .send()
@@ -67,7 +93,12 @@ impl TxLineAdapter {
                 if !matches_fixture(&payload, self.config.fixture_id) {
                     continue;
                 }
-                if let Some(probability) = extract_probability(&payload) {
+                if !matches_selection(&payload, &self.config.selection) {
+                    continue;
+                }
+                if let Some(probability) =
+                    extract_probability(&payload, Some(&self.config.selection))
+                {
                     let message_id =
                         extract_string(&payload, &["messageId", "MessageId", "message_id"])
                             .filter(|value| !value.trim().is_empty());
@@ -124,6 +155,60 @@ impl TxLineProofClient {
     }
 }
 
+impl TxLineDiscoveryClient {
+    pub fn new(origin: String, api_token: String) -> Result<Self> {
+        Ok(Self {
+            client: api_token_client(&api_token)?,
+            origin,
+            api_token,
+        })
+    }
+
+    pub async fn fixtures(&self) -> Result<Vec<TxLineFixture>> {
+        let client = data_client(&self.client, &self.origin, &self.api_token).await?;
+        let url = format!(
+            "{}/api/fixtures/snapshot",
+            self.origin.trim_end_matches('/')
+        );
+        let payload: Value = client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let fixtures = payload
+            .as_array()
+            .context("TxLINE fixtures snapshot must be an array")?
+            .iter()
+            .filter_map(parse_fixture)
+            .collect();
+        Ok(fixtures)
+    }
+
+    pub async fn odds_snapshot(&self, fixture_id: u64) -> Result<Vec<TxLineOddsLine>> {
+        let client = data_client(&self.client, &self.origin, &self.api_token).await?;
+        let url = format!(
+            "{}/api/odds/snapshot/{fixture_id}",
+            self.origin.trim_end_matches('/')
+        );
+        let payload: Value = client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let lines = payload
+            .as_array()
+            .context("TxLINE odds snapshot must be an array")?
+            .iter()
+            .filter_map(parse_odds_line)
+            .collect();
+        Ok(lines)
+    }
+}
+
 fn api_token_client(api_token: &str) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.insert("x-api-token", HeaderValue::from_str(api_token)?);
@@ -174,7 +259,17 @@ fn find_sse_separator(buffer: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-fn extract_probability(value: &Value) -> Option<Price> {
+fn extract_probability(value: &Value, selection: Option<&TxLineMarketSelection>) -> Option<Price> {
+    if let Some(selection) = selection
+        && let Some(values) = find_key(value, "Pct").and_then(Value::as_array)
+        && let Some(value) = values.get(selection.price_index)
+    {
+        let text = value
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| value.as_number().map(ToString::to_string))?;
+        return Price::from_decimal(&text).ok();
+    }
     for key in [
         "probability",
         "stablePrice",
@@ -193,6 +288,49 @@ fn extract_probability(value: &Value) -> Option<Price> {
         }
     }
     None
+}
+
+fn matches_selection(value: &Value, selection: &TxLineMarketSelection) -> bool {
+    extract_string(value, &["SuperOddsType", "superOddsType"])
+        .is_some_and(|value| value == selection.super_odds_type)
+        && extract_string(value, &["MarketParameters", "marketParameters"]).unwrap_or_default()
+            == selection.market_parameters
+        && extract_string(value, &["MarketPeriod", "marketPeriod"]).unwrap_or_default()
+            == selection.market_period
+}
+
+fn parse_fixture(value: &Value) -> Option<TxLineFixture> {
+    Some(TxLineFixture {
+        fixture_id: extract_u64(value, &["FixtureId", "fixtureId"])?,
+        participant_1: extract_string(value, &["Participant1", "participant1"])?,
+        participant_2: extract_string(value, &["Participant2", "participant2"])?,
+        participant_1_is_home: find_key(value, "Participant1IsHome")
+            .or_else(|| find_key(value, "participant1IsHome"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        start_time_ms: extract_u64(value, &["StartTime", "startTime"])?,
+        game_state: extract_u64(value, &["GameState", "gameState"]),
+    })
+}
+
+fn parse_odds_line(value: &Value) -> Option<TxLineOddsLine> {
+    let price_names = find_key(value, "PriceNames")
+        .or_else(|| find_key(value, "priceNames"))?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if price_names.is_empty() {
+        return None;
+    }
+    Some(TxLineOddsLine {
+        super_odds_type: extract_string(value, &["SuperOddsType", "superOddsType"])?,
+        market_parameters: extract_string(value, &["MarketParameters", "marketParameters"])
+            .unwrap_or_default(),
+        market_period: extract_string(value, &["MarketPeriod", "marketPeriod"]).unwrap_or_default(),
+        price_names,
+    })
 }
 
 fn extract_u64(value: &Value, keys: &[&str]) -> Option<u64> {
@@ -248,7 +386,7 @@ mod tests {
     #[test]
     fn extracts_nested_stable_price() {
         let value = serde_json::json!({"data": {"StablePrice": "0.617500"}});
-        assert_eq!(extract_probability(&value).unwrap().micros(), 617_500);
+        assert_eq!(extract_probability(&value, None).unwrap().micros(), 617_500);
     }
 
     #[test]
@@ -256,6 +394,29 @@ mod tests {
         let value = serde_json::json!({"data": {"FixtureId": 17588320}});
         assert!(matches_fixture(&value, 17_588_320));
         assert!(!matches_fixture(&value, 17_588_321));
+    }
+
+    #[test]
+    fn selects_the_recorded_price_index_from_a_txline_odds_line() {
+        let selection = TxLineMarketSelection {
+            super_odds_type: "match_result".into(),
+            market_parameters: String::new(),
+            market_period: "full_time".into(),
+            price_index: 1,
+            price_name: "draw".into(),
+        };
+        let value = serde_json::json!({
+            "SuperOddsType": "match_result",
+            "MarketPeriod": "full_time",
+            "Pct": ["0.510", "0.245", "0.245"]
+        });
+        assert!(matches_selection(&value, &selection));
+        assert_eq!(
+            extract_probability(&value, Some(&selection))
+                .unwrap()
+                .micros(),
+            245_000
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 export type FeedStatus = "connecting" | "live" | "stale" | "disconnected";
 export type FeedMode = "inactive" | "live";
+export type MappingStatus = "unavailable" | "discovering" | "ready";
 export type Side = "bid" | "ask";
 
 export interface MarketState {
@@ -75,4 +76,5 @@ export interface Snapshot {
 export interface FeedModeState {
   mode: FeedMode;
   live_available: boolean;
+  mapping_status: MappingStatus;
 }

@@ -1,4 +1,5 @@
 mod config;
+mod mapping;
 mod server;
 
 use std::{path::PathBuf, time::Instant};

@@ -77,6 +77,16 @@ function App() {
     return () => source.close();
   }, [loadState]);
 
+  useEffect(() => {
+    if (loadState !== "ready") return;
+    const refreshFeedMode = async () => {
+      const response = await fetch(`${API}/api/feed-mode`);
+      if (response.ok) setFeedMode((await response.json()) as FeedModeState);
+    };
+    const interval = window.setInterval(() => void refreshFeedMode(), 5_000);
+    return () => window.clearInterval(interval);
+  }, [loadState]);
+
   const setKilled = async (killed: boolean) => {
     setControlBusy(true);
     setControlError("");
@@ -176,6 +186,7 @@ function Header({
 }) {
   const live = feedMode?.mode === "live";
   const feedSwitchDisabled = feedBusy || (!live && !feedMode?.live_available);
+  const discoveryInProgress = feedMode?.mapping_status === "discovering";
   return (
     <header className="border-b border-border bg-surface">
       <div className="mx-auto flex min-h-16 w-full max-w-[1440px] flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-6 lg:px-8">
@@ -200,7 +211,7 @@ function Header({
               role="switch"
               aria-checked={live}
               aria-label={live ? "Stop live feeds" : "Start live feeds"}
-              title={feedMode?.live_available ? (live ? "Stop live feeds" : "Start live feeds") : "Set server-side TxLINE and Pascal credentials to enable live data"}
+              title={feedMode?.live_available ? (live ? "Stop live feeds" : "Start live feeds") : discoveryInProgress ? "Resolving a matching TxLINE fixture and Pascal market" : "Set TXLINE_API_TOKEN on the server to enable live data"}
               disabled={feedSwitchDisabled}
               aria-busy={feedBusy}
               onClick={() => void onFeedMode(live ? "inactive" : "live")}
@@ -208,7 +219,7 @@ function Header({
               {live ? <ToggleRight size={22} aria-hidden="true" /> : <ToggleLeft size={22} aria-hidden="true" />}
             </button>
             <span className={`font-mono text-xs ${live ? "text-success" : "text-muted"}`}>
-              {feedBusy ? "SWITCHING" : live ? "LIVE" : feedMode?.live_available ? "OFF" : "SETUP"}
+              {feedBusy ? "SWITCHING" : live ? "LIVE" : feedMode?.live_available ? "OFF" : discoveryInProgress ? "DISCOVERING" : "SETUP"}
             </span>
           </div>
           <span className="hidden border border-border bg-background px-3 py-2 font-mono text-xs text-secondary sm:inline-flex">
@@ -231,8 +242,13 @@ function Header({
 }
 
 function StatusStrip({ snapshot, market, feedMode }: { snapshot: Snapshot; market?: MarketState; feedMode: FeedModeState | null }) {
+  const feedDetail = feedMode?.mode === "live"
+    ? "TxLINE SSE"
+    : feedMode?.mapping_status === "discovering"
+      ? "resolving market"
+      : "feeds inactive";
   const metrics = [
-    { label: "Fair value", value: formatProbability(market?.fair_value), detail: feedMode?.mode === "live" ? "TxLINE SSE" : "feeds inactive", icon: DatabaseZap },
+    { label: "Fair value", value: formatProbability(market?.fair_value), detail: feedDetail, icon: DatabaseZap },
     { label: "Best market", value: `${formatProbability(market?.best_bid)} / ${formatProbability(market?.best_ask)}`, detail: "bid / ask", icon: Activity },
     { label: "Position", value: `${market?.position ?? 0}`, detail: "contracts", icon: CircleGauge },
     { label: "Mark-to-market", value: formatMoney(market?.pnl_micros), detail: `${compact(snapshot.processed_events)} events`, icon: ServerCog },
@@ -255,7 +271,7 @@ function StatusStrip({ snapshot, market, feedMode }: { snapshot: Snapshot; marke
 
 function MarketPanel({ market, history }: { market?: MarketState; history: number[] }) {
   if (!market) {
-    return <EmptyPanel title="No market mapped" detail="Add a fixture-to-market mapping to start the engine." />;
+    return <EmptyPanel title="Waiting for a matched market" detail="The service is resolving live TxLINE and Pascal market metadata." />;
   }
   const max = Math.max(...history, 1);
   const min = Math.min(...history, max);

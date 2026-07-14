@@ -31,6 +31,7 @@ use tower_http::{
 };
 
 use crate::config::BackendConfig;
+use crate::mapping::{DiscoveryConfig, ResolvedLiveFeed};
 type TradingEngine = Engine<DislocationTaker>;
 
 struct Runtime {
@@ -67,78 +68,9 @@ enum FeedMode {
 
 struct FeedController {
     mode: FeedMode,
-    live: Option<ConfiguredLiveFeed>,
+    live: Option<ResolvedLiveFeed>,
+    discovery: MappingStatus,
     workers: Vec<JoinHandle<()>>,
-}
-
-#[derive(Clone)]
-struct ConfiguredLiveFeed {
-    market: String,
-    pascal_symbol: String,
-    fixture_id: u64,
-    txline_origin: String,
-    api_token: String,
-    pascal_ws: String,
-}
-
-impl ConfiguredLiveFeed {
-    fn from_environment(market: Option<String>, pascal_symbol: Option<String>) -> Result<Self> {
-        let market = market
-            .or_else(|| optional_env("TXLINE_MARKET"))
-            .context("TXLINE_MARKET is required for live feeds")?;
-        let pascal_symbol = pascal_symbol
-            .or_else(|| optional_env("PASCAL_SYMBOL"))
-            .context("PASCAL_SYMBOL is required for live feeds")?;
-        let fixture_id = required_env("TXLINE_FIXTURE_ID")?
-            .parse()
-            .context("TXLINE_FIXTURE_ID must be an unsigned integer")?;
-        let api_token = required_env("TXLINE_API_TOKEN")?;
-        let config = Self {
-            market,
-            pascal_symbol,
-            fixture_id,
-            txline_origin: std::env::var("TXLINE_ORIGIN")
-                .unwrap_or_else(|_| "https://txline-dev.txodds.com".into()),
-            api_token,
-            pascal_ws: std::env::var("PASCAL_WS_URL")
-                .unwrap_or_else(|_| "wss://data.pascal.trade/ws".into()),
-        };
-        config.validate()?;
-        Ok(config)
-    }
-
-    fn optional_from_environment() -> Result<Option<Self>> {
-        let keys = [
-            "TXLINE_API_TOKEN",
-            "TXLINE_MARKET",
-            "PASCAL_SYMBOL",
-            "TXLINE_FIXTURE_ID",
-        ];
-        let configured = keys
-            .iter()
-            .filter(|key| optional_env(key).is_some())
-            .count();
-        if configured == 0 {
-            return Ok(None);
-        }
-        Self::from_environment(None, None).map(Some)
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.pascal_symbol.trim().is_empty() {
-            anyhow::bail!("PASCAL_SYMBOL cannot be empty");
-        }
-        if !self.pascal_ws.starts_with("ws://") && !self.pascal_ws.starts_with("wss://") {
-            anyhow::bail!("PASCAL_WS_URL must use ws:// or wss://");
-        }
-        TxLineAdapter::new(TxLineConfig {
-            origin: self.txline_origin.clone(),
-            api_token: self.api_token.clone(),
-            market: self.market.clone(),
-            fixture_id: self.fixture_id,
-        })?;
-        Ok(())
-    }
 }
 
 #[derive(Deserialize)]
@@ -150,6 +82,15 @@ struct SetFeedMode {
 struct FeedModeState {
     mode: FeedMode,
     live_available: bool,
+    mapping_status: MappingStatus,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MappingStatus {
+    Unavailable,
+    Discovering,
+    Ready,
 }
 
 #[derive(Serialize)]
@@ -189,18 +130,14 @@ pub async fn serve(
     let address: SocketAddr = bind.parse().context("invalid bind address")?;
     let configured_control_token = std::env::var("EDGERUNNER_CONTROL_TOKEN").ok();
     let control_token = resolve_control_token(address, configured_control_token)?;
-    let live = match live {
-        Some(config) => Some(ConfiguredLiveFeed::from_environment(
+    let resolver = match live {
+        Some(config) => Some(DiscoveryConfig::from_environment(
             config.market,
             config.pascal_symbol,
         )?),
-        None => ConfiguredLiveFeed::optional_from_environment()?,
+        None => DiscoveryConfig::optional_from_environment(None, None)?,
     };
-    let initial_mode = if live.is_some() {
-        FeedMode::Live
-    } else {
-        FeedMode::Inactive
-    };
+    let initial_mode = FeedMode::Inactive;
     let runtime = Arc::new(RwLock::new(Runtime {
         engine: Engine::new(
             DislocationTaker::new(config.strategy.clone()),
@@ -222,20 +159,19 @@ pub async fn serve(
         })
         .await
         .context("journal worker stopped during startup")?;
-    let workers = if let Some(live) = live.clone() {
-        spawn_live_feeds(runtime.clone(), snapshots.clone(), journal_tx.clone(), live)?
-    } else {
-        Vec::new()
-    };
-
     let state = AppState {
         runtime,
         snapshots,
         journal: journal_tx,
         feeds: Arc::new(Mutex::new(FeedController {
             mode: initial_mode,
-            live,
-            workers,
+            live: None,
+            discovery: if resolver.is_some() {
+                MappingStatus::Discovering
+            } else {
+                MappingStatus::Unavailable
+            },
+            workers: Vec::new(),
         })),
         control_token: Arc::new(control_token),
         config,
@@ -250,11 +186,15 @@ pub async fn serve(
         .route("/api/feed-mode", get(feed_mode).post(set_feed_mode))
         .route("/api/kill", post(kill))
         .route("/api/resume", post(resume))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(TraceLayer::new_for_http())
         .fallback_service(
             ServeDir::new("web/dist").not_found_service(ServeFile::new("web/dist/index.html")),
         );
+
+    if let Some(resolver) = resolver {
+        spawn_mapping_discovery(state.clone(), resolver);
+    }
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "EdgeRunner service listening");
@@ -332,6 +272,7 @@ async fn feed_mode(State(state): State<AppState>) -> Json<FeedModeState> {
     Json(FeedModeState {
         mode: controller.mode,
         live_available: controller.live.is_some(),
+        mapping_status: controller.discovery,
     })
 }
 
@@ -458,16 +399,16 @@ fn spawn_live_feeds(
     runtime: Arc<RwLock<Runtime>>,
     snapshots: broadcast::Sender<EngineSnapshot>,
     journal: mpsc::Sender<JournalRecord>,
-    live: ConfiguredLiveFeed,
+    live: ResolvedLiveFeed,
 ) -> Result<Vec<JoinHandle<()>>> {
-    live.validate()?;
     let (sender, mut receiver) = mpsc::channel(4096);
 
     let txline_config = TxLineConfig {
-        origin: live.txline_origin,
-        api_token: live.api_token,
-        market: live.market.clone(),
-        fixture_id: live.fixture_id,
+        origin: live.txline_origin.clone(),
+        api_token: live.api_token.clone(),
+        market: live.mapping.market.clone(),
+        fixture_id: live.mapping.fixture_id,
+        selection: live.mapping.txline_selection.clone(),
     };
     let proof_client = TxLineProofClient::new(&txline_config)?;
     let (proof_sender, proof_receiver) = mpsc::channel(512);
@@ -506,8 +447,8 @@ fn spawn_live_feeds(
 
     let pascal_config = PascalConfig {
         ws_url: live.pascal_ws,
-        symbol: live.pascal_symbol,
-        market: live.market,
+        symbol: live.mapping.pascal_symbol,
+        market: live.mapping.market,
     };
     let pascal_runtime = runtime.clone();
     let pascal_snapshots = snapshots.clone();
@@ -659,22 +600,21 @@ async fn switch_feed_mode(state: &AppState, mode: FeedMode) -> Result<FeedModeSt
         return Ok(FeedModeState {
             mode,
             live_available: controller.live.is_some(),
+            mapping_status: controller.discovery,
         });
     }
 
     let live = match mode {
         FeedMode::Inactive => None,
-        FeedMode::Live => Some(
-            controller
-                .live
-                .clone()
-                .context("live feeds are not configured on this server")?,
-        ),
+        FeedMode::Live => {
+            let reason = match controller.discovery {
+                MappingStatus::Discovering => "market mapping discovery is still in progress",
+                MappingStatus::Unavailable => "live feeds require TXLINE_API_TOKEN",
+                MappingStatus::Ready => "discovered live feed is unavailable",
+            };
+            Some(controller.live.clone().context(reason)?)
+        }
     };
-    if let Some(live) = &live {
-        live.validate()?;
-    }
-
     for worker in controller.workers.drain(..) {
         worker.abort();
     }
@@ -684,6 +624,16 @@ async fn switch_feed_mode(state: &AppState, mode: FeedMode) -> Result<FeedModeSt
         .send(run_record)
         .await
         .context("journal worker stopped during feed switch")?;
+    if let Some(live) = &live {
+        state
+            .journal
+            .send(JournalRecord::Mapping {
+                schema: 2,
+                mapping: live.mapping.clone(),
+            })
+            .await
+            .context("journal worker stopped during feed switch")?;
+    }
     let _ = state.snapshots.send(snapshot);
 
     controller.workers = match live {
@@ -699,7 +649,67 @@ async fn switch_feed_mode(state: &AppState, mode: FeedMode) -> Result<FeedModeSt
     Ok(FeedModeState {
         mode,
         live_available: controller.live.is_some(),
+        mapping_status: controller.discovery,
     })
+}
+
+fn spawn_mapping_discovery(state: AppState, resolver: DiscoveryConfig) {
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(5);
+        loop {
+            match resolver.resolve().await {
+                Ok(live) => {
+                    let mut controller = state.feeds.lock().await;
+                    if controller.live.is_some() {
+                        return;
+                    }
+                    let (run_record, snapshot) =
+                        reset_runtime(&state.runtime, &state.config, FeedMode::Live).await;
+                    if state.journal.send(run_record).await.is_err()
+                        || state
+                            .journal
+                            .send(JournalRecord::Mapping {
+                                schema: 2,
+                                mapping: live.mapping.clone(),
+                            })
+                            .await
+                            .is_err()
+                    {
+                        tracing::error!(
+                            "journal worker stopped while saving discovered market mapping"
+                        );
+                        return;
+                    }
+                    match spawn_live_feeds(
+                        state.runtime.clone(),
+                        state.snapshots.clone(),
+                        state.journal.clone(),
+                        live.clone(),
+                    ) {
+                        Ok(workers) => {
+                            controller.workers = workers;
+                            controller.live = Some(live);
+                            controller.mode = FeedMode::Live;
+                            controller.discovery = MappingStatus::Ready;
+                            let _ = state.snapshots.send(snapshot);
+                            tracing::info!(
+                                "discovered and activated a TxLINE-to-Pascal market mapping"
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "discovered market mapping could not start live feeds");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, ?backoff, "market mapping discovery will retry");
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(60));
+        }
+    });
 }
 
 async fn reset_runtime(
@@ -734,16 +744,6 @@ fn feed_status_for(mode: FeedMode) -> BTreeMap<String, FeedStatus> {
         FeedMode::Live => FeedStatus::Connecting,
     };
     BTreeMap::from([("txline".to_owned(), status), ("pascal".to_owned(), status)])
-}
-
-fn optional_env(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn required_env(key: &str) -> Result<String> {
-    optional_env(key).with_context(|| format!("{key} is required for live feeds"))
 }
 
 async fn set_feed_status(

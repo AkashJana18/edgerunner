@@ -14,6 +14,25 @@ pub enum MarketDataSource {
     Pascal,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TxLineMarketSelection {
+    pub super_odds_type: String,
+    pub market_parameters: String,
+    pub market_period: String,
+    pub price_index: usize,
+    pub price_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MarketMapping {
+    pub fixture_id: u64,
+    pub fixture_label: String,
+    pub fixture_start_time_ms: u64,
+    pub market: String,
+    pub pascal_symbol: String,
+    pub txline_selection: TxLineMarketSelection,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum JournalRecord {
@@ -21,6 +40,10 @@ pub enum JournalRecord {
         schema: u16,
         run_id: Uuid,
         started_at: DateTime<Utc>,
+    },
+    Mapping {
+        schema: u16,
+        mapping: MarketMapping,
     },
     Event {
         schema: u16,

@@ -74,7 +74,7 @@ cargo run --release -p edgerunner -- probe \
 
 ### Live Feeds, Recorded Replay, Paper Execution
 
-Use TxLINE devnet's free tier to get a real `StablePrice` feed. TxLINE requires a signed devnet
+Use TxLINE devnet's free tier to get a real odds feed. TxLINE requires a signed devnet
 subscription from the wallet that will own the credentials. The official
 [free-tier guide](https://txline-docs.txodds.com/documentation/worldcup) and
 [runnable devnet script](https://txline-docs.txodds.com/documentation/examples/devnet-examples)
@@ -85,19 +85,20 @@ or secret manager, never in the repository.
 # The credentials must be activated against the same devnet wallet that submitted the subscription.
 export TXLINE_ORIGIN=https://txline-dev.txodds.com
 export TXLINE_API_TOKEN=...
-export TXLINE_FIXTURE_ID=YOUR_TXLINE_FIXTURE_ID
-export TXLINE_MARKET=YOUR_INTERNAL_MARKET_KEY
-export PASCAL_WS_URL=wss://data.pascal.trade/ws
-export PASCAL_SYMBOL=YOUR_PASCAL_MARKET_SYMBOL
 
-# Start the real TxLINE SSE and Pascal L2 workers.
+# Start automatic TxLINE fixture/Pascal market discovery.
 cargo run -p edgerunner -- serve
 ```
 
-Get the fixture ID from the TxLINE fixture/odds snapshot after activating your subscription. The
-odds stream carries all permitted updates, so EdgeRunner drops events that do not match
-`TXLINE_FIXTURE_ID`; map the selected fixture to its corresponding Pascal market through
-`TXLINE_MARKET` and `PASCAL_SYMBOL`.
+With only `TXLINE_API_TOKEN`, EdgeRunner fetches TxLINE's live/upcoming fixture snapshot and each
+candidate's odds snapshot, then queries Pascal's public market catalogue. It only activates a feed
+when both event participants, start time, market period, numeric line (where present), and outcome
+match; otherwise it remains in `DISCOVERING` and retries. The TxLINE SSE connection is then filtered
+to the recorded fixture and outcome selection. This never falls back to generated market data.
+
+`TXLINE_FIXTURE_ID`, `TXLINE_MARKET`, and `PASCAL_SYMBOL` are optional overrides for a known
+fixture, internal market label, or Pascal symbol. `PASCAL_WS_URL` remains optional and defaults to
+`wss://data.pascal.trade/ws`.
 
 `PASCAL_WS_URL=wss://data.pascal.trade/ws` is Pascal's public market-data WebSocket and does not
 require credentials. If Pascal introduces private-market access for the selected product, add its
@@ -106,9 +107,10 @@ come from that public WebSocket.
 
 The service loads `.env` at startup, with process environment variables taking precedence. The
 dashboard control toggles only between `live` and `inactive`; it never creates a fallback market feed.
-Toggling starts or stops the real workers and opens a new paper run so a recording is never mixed
-across feed sessions. It shows each feed as connecting/live/disconnected. You can override the
-mapping with `--live-feeds --market ... --pascal-symbol ...`.
+Discovery automatically activates matching real workers and opens a new paper run. The selected
+fixture, Pascal symbol, and TxLINE outcome are appended to the journal before market events, so replay
+uses the recorded mapping rather than a fresh lookup. You can also override the market label or Pascal
+symbol with `--live-feeds --market ... --pascal-symbol ...`.
 
 TxLINE guest JWTs are obtained from `TXLINE_ORIGIN/auth/guest/start` whenever an SSE connection or
 proof lookup is opened. Do not persist `TXLINE_GUEST_JWT`; the activated `TXLINE_API_TOKEN` is sent
