@@ -1,5 +1,11 @@
 use std::{
-    collections::BTreeMap, convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc,
+    collections::BTreeMap,
+    convert::Infallible,
+    fs::File,
+    io::{BufRead, BufReader},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,8 +21,8 @@ use edgerunner_adapters::{
     PascalBookAdapter, PascalConfig, TxLineAdapter, TxLineConfig, TxLineProofClient,
 };
 use edgerunner_core::{
-    DislocationTaker, Engine, EngineSnapshot, FeedStatus, JournalRecord, JournalWriter,
-    MarketDataSource, OrderMode,
+    DislocationTaker, Engine, EngineSnapshot, EventEnvelope, FeedStatus, JournalRecord,
+    JournalWriter, MarketDataSource, MarketEvent, OrderMode,
 };
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
@@ -40,6 +46,7 @@ struct Runtime {
     killed: bool,
     feed_mode: FeedMode,
     feed_status: BTreeMap<String, FeedStatus>,
+    replay: ReplayRuntime,
 }
 
 impl Runtime {
@@ -57,6 +64,8 @@ struct AppState {
     feeds: Arc<Mutex<FeedController>>,
     control_token: Arc<String>,
     config: BackendConfig,
+    replay_events: Arc<Vec<RecordedEvent>>,
+    replay_journal: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -66,11 +75,101 @@ enum FeedMode {
     Live,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Environment {
+    Devnet,
+    Mainnet,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RunMode {
+    Live,
+    Replay,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReplayStatus {
+    Paused,
+    Playing,
+    Complete,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ReplayRuntime {
+    status: ReplayStatus,
+    event_index: usize,
+    total_events: usize,
+    speed: f64,
+    journal: String,
+}
+
+#[derive(Clone, Debug)]
+struct RecordedEvent {
+    event: EventEnvelope,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ReplayCommandRequest {
+    Play,
+    Pause,
+    Reset,
+    SetSpeed { speed: f64 },
+    Seek { event_index: usize },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReplayCommand {
+    Play,
+    Pause,
+    Reset,
+    SetSpeed(f64),
+    Seek(usize),
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionMode {
+    Simulated,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MarketDisplay {
+    event: String,
+    contract: String,
+    period: String,
+    starts_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SessionState {
+    environment: Environment,
+    run_mode: RunMode,
+    execution: ExecutionMode,
+    live_available: bool,
+    mapping_status: MappingStatus,
+    replay: ReplayRuntime,
+    market: Option<MarketDisplay>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SetSessionRequest {
+    environment: Option<Environment>,
+    run_mode: Option<RunMode>,
+}
+
 struct FeedController {
     mode: FeedMode,
+    environment: Environment,
+    run_mode: RunMode,
     live: Option<ResolvedLiveFeed>,
     discovery: MappingStatus,
     workers: Vec<JoinHandle<()>>,
+    replay_tx: Option<mpsc::Sender<ReplayCommand>>,
 }
 
 #[derive(Deserialize)]
@@ -85,7 +184,7 @@ struct FeedModeState {
     mapping_status: MappingStatus,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum MappingStatus {
     Unavailable,
@@ -130,6 +229,11 @@ pub async fn serve(
     let address: SocketAddr = bind.parse().context("invalid bind address")?;
     let configured_control_token = std::env::var("EDGERUNNER_CONTROL_TOKEN").ok();
     let control_token = resolve_control_token(address, configured_control_token)?;
+    let replay_journal = journal_path.display().to_string();
+    let replay_events = Arc::new(load_replay_events(&journal_path).unwrap_or_else(|error| {
+        tracing::warn!(%error, path = %journal_path.display(), "replay journal unavailable");
+        Vec::new()
+    }));
     let resolver = match live {
         Some(config) => Some(DiscoveryConfig::from_environment(
             config.market,
@@ -147,6 +251,17 @@ pub async fn serve(
         killed: false,
         feed_mode: initial_mode,
         feed_status: feed_status_for(initial_mode),
+        replay: ReplayRuntime {
+            status: if replay_events.is_empty() {
+                ReplayStatus::Unavailable
+            } else {
+                ReplayStatus::Paused
+            },
+            event_index: 0,
+            total_events: replay_events.len(),
+            speed: 1.0,
+            journal: replay_journal.clone(),
+        },
     }));
     let (snapshots, _) = broadcast::channel(128);
     let (journal_tx, journal_rx) = mpsc::channel(4096);
@@ -165,6 +280,8 @@ pub async fn serve(
         journal: journal_tx,
         feeds: Arc::new(Mutex::new(FeedController {
             mode: initial_mode,
+            environment: Environment::Devnet,
+            run_mode: RunMode::Live,
             live: None,
             discovery: if resolver.is_some() {
                 MappingStatus::Discovering
@@ -172,9 +289,12 @@ pub async fn serve(
                 MappingStatus::Unavailable
             },
             workers: Vec::new(),
+            replay_tx: None,
         })),
         control_token: Arc::new(control_token),
         config,
+        replay_events,
+        replay_journal,
     };
     let app = Router::new()
         .route("/api/health", get(health))
@@ -183,6 +303,8 @@ pub async fn serve(
         .route("/api/snapshot", get(snapshot))
         .route("/api/events", get(events))
         .route("/api/metrics", get(metrics))
+        .route("/api/session", get(session).post(set_session))
+        .route("/api/replay", post(replay_command))
         .route("/api/feed-mode", get(feed_mode).post(set_feed_mode))
         .route("/api/kill", post(kill))
         .route("/api/resume", post(resume))
@@ -274,6 +396,135 @@ async fn feed_mode(State(state): State<AppState>) -> Json<FeedModeState> {
         live_available: controller.live.is_some(),
         mapping_status: controller.discovery,
     })
+}
+
+async fn session(State(state): State<AppState>) -> Json<SessionState> {
+    let controller = state.feeds.lock().await;
+    let runtime = state.runtime.read().await;
+    Json(session_state(&controller, &runtime))
+}
+
+async fn set_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SetSessionRequest>,
+) -> Result<Json<SessionState>, (StatusCode, Json<ApiError>)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "control token rejected".into(),
+            }),
+        ));
+    }
+    let current = {
+        let controller = state.feeds.lock().await;
+        (controller.environment, controller.run_mode)
+    };
+    let environment = request.environment.unwrap_or(current.0);
+    let run_mode = request.run_mode.unwrap_or(current.1);
+    switch_session(&state, environment, run_mode)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: error.to_string(),
+                }),
+            )
+        })
+}
+
+async fn replay_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReplayCommandRequest>,
+) -> Result<Json<SessionState>, (StatusCode, Json<ApiError>)> {
+    if !authorized(&state, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "control token rejected".into(),
+            }),
+        ));
+    }
+    let command = match request {
+        ReplayCommandRequest::Play => ReplayCommand::Play,
+        ReplayCommandRequest::Pause => ReplayCommand::Pause,
+        ReplayCommandRequest::Reset => ReplayCommand::Reset,
+        ReplayCommandRequest::SetSpeed { speed } => {
+            if !speed.is_finite() || !(0.25..=20.0).contains(&speed) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError {
+                        error: "replay speed must be between 0.25x and 20x".into(),
+                    }),
+                ));
+            }
+            ReplayCommand::SetSpeed(speed)
+        }
+        ReplayCommandRequest::Seek { event_index } => ReplayCommand::Seek(event_index),
+    };
+    let sender = {
+        let controller = state.feeds.lock().await;
+        if controller.run_mode != RunMode::Replay {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "replay controls are available only in replay mode".into(),
+                }),
+            ));
+        }
+        controller.replay_tx.clone()
+    };
+    let Some(sender) = sender else {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "replay is unavailable for the selected journal".into(),
+            }),
+        ));
+    };
+    sender.send(command).await.map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "replay worker is no longer running".into(),
+            }),
+        )
+    })?;
+    let controller = state.feeds.lock().await;
+    let runtime = state.runtime.read().await;
+    Ok(Json(session_state(&controller, &runtime)))
+}
+
+fn session_state(controller: &FeedController, runtime: &Runtime) -> SessionState {
+    let live_available = controller.environment == Environment::Devnet
+        && controller.live.is_some()
+        && controller.discovery == MappingStatus::Ready;
+    let market = controller.live.as_ref().and_then(|live| {
+        let active_market = &runtime.engine.state.market;
+        (active_market.is_empty() || active_market == &live.mapping.market).then(|| MarketDisplay {
+            event: live.event_label.clone(),
+            contract: live.contract_label.clone(),
+            period: live.market_period.clone(),
+            starts_at_ms: live.expected_event_start_time_ms,
+        })
+    });
+    SessionState {
+        environment: controller.environment,
+        run_mode: controller.run_mode,
+        execution: ExecutionMode::Simulated,
+        live_available,
+        mapping_status: if controller.environment == Environment::Mainnet {
+            MappingStatus::Unavailable
+        } else {
+            controller.discovery
+        },
+        replay: runtime.replay.clone(),
+        market,
+    }
 }
 
 async fn set_feed_mode(
@@ -380,7 +631,7 @@ async fn metrics(State(state): State<AppState>) -> String {
 
 fn spawn_journal(path: PathBuf, mut receiver: mpsc::Receiver<JournalRecord>) {
     tokio::task::spawn_blocking(move || {
-        let mut writer = match JournalWriter::create(path) {
+        let mut writer = match JournalWriter::open(path) {
             Ok(writer) => writer,
             Err(error) => {
                 tracing::error!(%error, "failed to open journal");
@@ -482,57 +733,15 @@ fn spawn_live_feeds(
 
     let event_worker = tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {
-            let (feed, source) = match &event.event {
-                edgerunner_core::MarketEvent::FairValue { .. } => {
-                    ("txline", MarketDataSource::Txline)
-                }
-                edgerunner_core::MarketEvent::Book { .. } => ("pascal", MarketDataSource::Pascal),
-                _ => {
-                    tracing::warn!("dropping market event without a configured live source");
-                    continue;
-                }
-            };
-            let _ = journal
-                .send(JournalRecord::Event {
-                    schema: 2,
-                    source,
-                    event: event.clone(),
-                })
-                .await;
-            let (records, proof_requests, snapshot) = {
-                let mut guard = runtime.write().await;
-                guard.feed_status.insert(feed.into(), FeedStatus::Live);
-                let mut records = Vec::new();
-                let mut proof_requests = Vec::new();
-                for output in guard.engine.process(event) {
-                    if output.decision.action == "submitted"
-                        && let Some(intent) = output.decision.intent.as_ref()
-                        && let (Some(message_id), Some(proof_ts)) =
-                            (&intent.source_message_id, intent.source_proof_ts)
-                    {
-                        proof_requests.push(ProofRequest {
-                            order_id: intent.id,
-                            message_id: message_id.clone(),
-                            proof_ts,
-                        });
-                    }
-                    records.push(JournalRecord::Decision {
-                        schema: 2,
-                        decision: output.decision,
-                    });
-                    if let Some(fill) = output.fill {
-                        records.push(JournalRecord::Fill { schema: 2, fill });
-                    }
-                }
-                (records, proof_requests, guard.snapshot())
-            };
-            for record in records {
-                let _ = journal.send(record).await;
-            }
-            for request in proof_requests {
-                let _ = proof_sender.send(request).await;
-            }
-            let _ = snapshots.send(snapshot);
+            process_market_event(
+                runtime.clone(),
+                snapshots.clone(),
+                journal.clone(),
+                Some(proof_sender.clone()),
+                event,
+                true,
+            )
+            .await;
         }
     });
     Ok(vec![
@@ -541,6 +750,69 @@ fn spawn_live_feeds(
         pascal_worker,
         event_worker,
     ])
+}
+
+async fn process_market_event(
+    runtime: Arc<RwLock<Runtime>>,
+    snapshots: broadcast::Sender<EngineSnapshot>,
+    journal: mpsc::Sender<JournalRecord>,
+    proof_sender: Option<mpsc::Sender<ProofRequest>>,
+    event: EventEnvelope,
+    record_event: bool,
+) {
+    let (feed, source) = match &event.event {
+        edgerunner_core::MarketEvent::FairValue { .. } => ("txline", MarketDataSource::Txline),
+        edgerunner_core::MarketEvent::Book { .. } => ("pascal", MarketDataSource::Pascal),
+        _ => {
+            tracing::warn!("dropping market event without a configured source");
+            return;
+        }
+    };
+    if record_event {
+        let _ = journal
+            .send(JournalRecord::Event {
+                schema: 2,
+                source,
+                event: event.clone(),
+            })
+            .await;
+    }
+    let (records, proof_requests, snapshot) = {
+        let mut guard = runtime.write().await;
+        guard.feed_status.insert(feed.into(), FeedStatus::Live);
+        let mut records = Vec::new();
+        let mut proof_requests = Vec::new();
+        for output in guard.engine.process(event) {
+            if output.decision.action == "submitted"
+                && let Some(intent) = output.decision.intent.as_ref()
+                && let (Some(message_id), Some(proof_ts)) =
+                    (&intent.source_message_id, intent.source_proof_ts)
+            {
+                proof_requests.push(ProofRequest {
+                    order_id: intent.id,
+                    message_id: message_id.clone(),
+                    proof_ts,
+                });
+            }
+            records.push(JournalRecord::Decision {
+                schema: 2,
+                decision: output.decision,
+            });
+            if let Some(fill) = output.fill {
+                records.push(JournalRecord::Fill { schema: 2, fill });
+            }
+        }
+        (records, proof_requests, guard.snapshot())
+    };
+    for record in records {
+        let _ = journal.send(record).await;
+    }
+    if let Some(proof_sender) = proof_sender {
+        for request in proof_requests {
+            let _ = proof_sender.send(request).await;
+        }
+    }
+    let _ = snapshots.send(snapshot);
 }
 
 fn spawn_proof_worker(
@@ -594,14 +866,406 @@ fn spawn_proof_worker(
     })
 }
 
+fn load_replay_events(path: &PathBuf) -> Result<Vec<RecordedEvent>> {
+    if !path.exists() {
+        anyhow::bail!("replay journal does not exist")
+    }
+    let file =
+        File::open(path).with_context(|| format!("open replay journal {}", path.display()))?;
+    let mut events = Vec::new();
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
+        let record: JournalRecord = serde_json::from_str(
+            &line.with_context(|| format!("read replay journal line {}", line_number + 1))?,
+        )
+        .with_context(|| format!("parse replay journal line {}", line_number + 1))?;
+        if let JournalRecord::Event { source, event, .. } = record {
+            let valid = match (&source, &event.event) {
+                (
+                    MarketDataSource::Txline,
+                    MarketEvent::FairValue {
+                        message_id: Some(message_id),
+                        proof_ts: Some(_),
+                        ..
+                    },
+                ) if !message_id.trim().is_empty() => true,
+                (MarketDataSource::Pascal, MarketEvent::Book { .. }) => true,
+                _ => false,
+            };
+            if valid {
+                events.push(RecordedEvent { event });
+            }
+        }
+    }
+    Ok(events)
+}
+
+async fn switch_session(
+    state: &AppState,
+    environment: Environment,
+    run_mode: RunMode,
+) -> Result<SessionState> {
+    let mut controller = state.feeds.lock().await;
+    for worker in controller.workers.drain(..) {
+        worker.abort();
+    }
+    controller.replay_tx = None;
+    controller.environment = environment;
+    controller.run_mode = run_mode;
+    controller.mode = FeedMode::Inactive;
+
+    match run_mode {
+        RunMode::Replay => {
+            let (run_record, snapshot) =
+                reset_runtime(&state.runtime, &state.config, FeedMode::Inactive).await;
+            let _ = state.journal.send(run_record).await;
+            let _ = state.snapshots.send(snapshot);
+            let (sender, worker) = spawn_replay_worker(
+                state.runtime.clone(),
+                state.snapshots.clone(),
+                state.journal.clone(),
+                state.config.clone(),
+                state.replay_events.clone(),
+                state.replay_journal.clone(),
+            );
+            controller.replay_tx = Some(sender);
+            controller.workers.push(worker);
+        }
+        RunMode::Live => {
+            let feed_mode = if environment == Environment::Devnet && controller.live.is_some() {
+                FeedMode::Live
+            } else {
+                FeedMode::Inactive
+            };
+            let (run_record, snapshot) =
+                reset_runtime(&state.runtime, &state.config, feed_mode).await;
+            let _ = state.journal.send(run_record).await;
+            let _ = state.snapshots.send(snapshot);
+            if feed_mode == FeedMode::Live
+                && let Some(live) = controller.live.clone()
+            {
+                controller.workers = spawn_live_feeds(
+                    state.runtime.clone(),
+                    state.snapshots.clone(),
+                    state.journal.clone(),
+                    live,
+                )?;
+                controller.mode = FeedMode::Live;
+            }
+        }
+    }
+
+    let runtime = state.runtime.read().await;
+    Ok(session_state(&controller, &runtime))
+}
+
+fn spawn_replay_worker(
+    runtime: Arc<RwLock<Runtime>>,
+    snapshots: broadcast::Sender<EngineSnapshot>,
+    journal: mpsc::Sender<JournalRecord>,
+    config: BackendConfig,
+    events: Arc<Vec<RecordedEvent>>,
+    replay_journal: String,
+) -> (mpsc::Sender<ReplayCommand>, JoinHandle<()>) {
+    let (sender, mut receiver) = mpsc::channel(32);
+    let command_sender = sender.clone();
+    let worker = tokio::spawn(async move {
+        let mut index = 0_usize;
+        let mut speed = 1.0_f64;
+        let mut playing = false;
+        let mut previous_time_ns = None;
+        update_replay_state(
+            &runtime,
+            &snapshots,
+            if events.is_empty() {
+                ReplayStatus::Unavailable
+            } else {
+                ReplayStatus::Paused
+            },
+            index,
+            events.len(),
+            speed,
+            &replay_journal,
+        )
+        .await;
+
+        loop {
+            if !playing {
+                let Some(command) = receiver.recv().await else {
+                    return;
+                };
+                if handle_replay_command(
+                    command,
+                    &runtime,
+                    &snapshots,
+                    &journal,
+                    &config,
+                    &events,
+                    &replay_journal,
+                    &mut index,
+                    &mut speed,
+                    &mut previous_time_ns,
+                    &mut playing,
+                )
+                .await
+                {
+                    return;
+                }
+                continue;
+            }
+
+            if index >= events.len() {
+                playing = false;
+                update_replay_state(
+                    &runtime,
+                    &snapshots,
+                    ReplayStatus::Complete,
+                    index,
+                    events.len(),
+                    speed,
+                    &replay_journal,
+                )
+                .await;
+                continue;
+            }
+
+            let delay = replay_delay(
+                previous_time_ns,
+                events[index].event.received_time_ns,
+                speed,
+            );
+            tokio::select! {
+                command = receiver.recv() => {
+                    let Some(command) = command else { return; };
+                    if handle_replay_command(
+                        command,
+                        &runtime,
+                        &snapshots,
+                        &journal,
+                        &config,
+                        &events,
+                        &replay_journal,
+                        &mut index,
+                        &mut speed,
+                        &mut previous_time_ns,
+                        &mut playing,
+                    ).await { return; }
+                }
+                _ = tokio::time::sleep(delay) => {
+                    let recorded = events[index].clone();
+                    previous_time_ns = Some(recorded.event.received_time_ns);
+                    process_market_event(
+                        runtime.clone(),
+                        snapshots.clone(),
+                        journal.clone(),
+                        None,
+                        recorded.event,
+                        false,
+                    ).await;
+                    index = index.saturating_add(1);
+                    update_replay_state(
+                        &runtime,
+                        &snapshots,
+                        if index >= events.len() { ReplayStatus::Complete } else { ReplayStatus::Playing },
+                        index,
+                        events.len(),
+                        speed,
+                        &replay_journal,
+                    ).await;
+                    if index >= events.len() { playing = false; }
+                }
+            }
+        }
+    });
+    (command_sender, worker)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_replay_command(
+    command: ReplayCommand,
+    runtime: &Arc<RwLock<Runtime>>,
+    snapshots: &broadcast::Sender<EngineSnapshot>,
+    journal: &mpsc::Sender<JournalRecord>,
+    config: &BackendConfig,
+    events: &[RecordedEvent],
+    replay_journal: &str,
+    index: &mut usize,
+    speed: &mut f64,
+    previous_time_ns: &mut Option<u64>,
+    playing: &mut bool,
+) -> bool {
+    match command {
+        ReplayCommand::Play => {
+            if events.is_empty() {
+                *playing = false;
+                update_replay_state(
+                    runtime,
+                    snapshots,
+                    ReplayStatus::Unavailable,
+                    *index,
+                    events.len(),
+                    *speed,
+                    replay_journal,
+                )
+                .await;
+                return false;
+            }
+            if *index >= events.len() {
+                let (run_record, snapshot) =
+                    reset_runtime(runtime, config, FeedMode::Inactive).await;
+                let _ = journal.send(run_record).await;
+                let _ = snapshots.send(snapshot);
+                *index = 0;
+                *previous_time_ns = None;
+            }
+            *playing = true;
+            update_replay_state(
+                runtime,
+                snapshots,
+                ReplayStatus::Playing,
+                *index,
+                events.len(),
+                *speed,
+                replay_journal,
+            )
+            .await;
+        }
+        ReplayCommand::Pause => {
+            *playing = false;
+            update_replay_state(
+                runtime,
+                snapshots,
+                ReplayStatus::Paused,
+                *index,
+                events.len(),
+                *speed,
+                replay_journal,
+            )
+            .await;
+        }
+        ReplayCommand::Reset => {
+            let (run_record, snapshot) = reset_runtime(runtime, config, FeedMode::Inactive).await;
+            let _ = journal.send(run_record).await;
+            let _ = snapshots.send(snapshot);
+            *index = 0;
+            *previous_time_ns = None;
+            *playing = false;
+            update_replay_state(
+                runtime,
+                snapshots,
+                if events.is_empty() {
+                    ReplayStatus::Unavailable
+                } else {
+                    ReplayStatus::Paused
+                },
+                *index,
+                events.len(),
+                *speed,
+                replay_journal,
+            )
+            .await;
+        }
+        ReplayCommand::SetSpeed(next_speed) => {
+            *speed = next_speed.clamp(0.25, 20.0);
+            update_replay_state(
+                runtime,
+                snapshots,
+                if *playing {
+                    ReplayStatus::Playing
+                } else {
+                    ReplayStatus::Paused
+                },
+                *index,
+                events.len(),
+                *speed,
+                replay_journal,
+            )
+            .await;
+        }
+        ReplayCommand::Seek(target) => {
+            let target = target.min(events.len());
+            let (run_record, snapshot) = reset_runtime(runtime, config, FeedMode::Inactive).await;
+            let _ = journal.send(run_record).await;
+            let _ = snapshots.send(snapshot);
+            *index = 0;
+            *previous_time_ns = None;
+            *playing = false;
+            for recorded in events.iter().take(target).cloned() {
+                *previous_time_ns = Some(recorded.event.received_time_ns);
+                process_market_event(
+                    runtime.clone(),
+                    snapshots.clone(),
+                    journal.clone(),
+                    None,
+                    recorded.event,
+                    false,
+                )
+                .await;
+                *index = (*index).saturating_add(1);
+            }
+            update_replay_state(
+                runtime,
+                snapshots,
+                if *index >= events.len() {
+                    ReplayStatus::Complete
+                } else {
+                    ReplayStatus::Paused
+                },
+                *index,
+                events.len(),
+                *speed,
+                replay_journal,
+            )
+            .await;
+        }
+    }
+    false
+}
+
+fn replay_delay(previous_time_ns: Option<u64>, current_time_ns: u64, speed: f64) -> Duration {
+    let Some(previous_time_ns) = previous_time_ns else {
+        return Duration::ZERO;
+    };
+    let delta_ns = current_time_ns.saturating_sub(previous_time_ns);
+    let scaled_ns = (delta_ns as f64 / speed).min(2_000_000_000.0) as u64;
+    Duration::from_nanos(scaled_ns.max(20_000_000))
+}
+
+async fn update_replay_state(
+    runtime: &Arc<RwLock<Runtime>>,
+    snapshots: &broadcast::Sender<EngineSnapshot>,
+    status: ReplayStatus,
+    event_index: usize,
+    total_events: usize,
+    speed: f64,
+    journal: &str,
+) {
+    let snapshot = {
+        let mut guard = runtime.write().await;
+        guard.replay = ReplayRuntime {
+            status,
+            event_index,
+            total_events,
+            speed,
+            journal: journal.to_owned(),
+        };
+        guard.snapshot()
+    };
+    let _ = snapshots.send(snapshot);
+}
+
 async fn switch_feed_mode(state: &AppState, mode: FeedMode) -> Result<FeedModeState> {
     let mut controller = state.feeds.lock().await;
     if controller.mode == mode {
         return Ok(FeedModeState {
             mode,
-            live_available: controller.live.is_some(),
+            live_available: controller.environment == Environment::Devnet
+                && controller.live.is_some(),
             mapping_status: controller.discovery,
         });
+    }
+
+    if mode == FeedMode::Live && controller.environment == Environment::Mainnet {
+        anyhow::bail!("mainnet live feeds are not configured")
     }
 
     let live = match mode {
@@ -618,6 +1282,8 @@ async fn switch_feed_mode(state: &AppState, mode: FeedMode) -> Result<FeedModeSt
     for worker in controller.workers.drain(..) {
         worker.abort();
     }
+    controller.replay_tx = None;
+    controller.run_mode = RunMode::Live;
     let (run_record, snapshot) = reset_runtime(&state.runtime, &state.config, mode).await;
     state
         .journal
@@ -648,7 +1314,7 @@ async fn switch_feed_mode(state: &AppState, mode: FeedMode) -> Result<FeedModeSt
     controller.mode = mode;
     Ok(FeedModeState {
         mode,
-        live_available: controller.live.is_some(),
+        live_available: controller.environment == Environment::Devnet && controller.live.is_some(),
         mapping_status: controller.discovery,
     })
 }
@@ -663,34 +1329,47 @@ fn spawn_mapping_discovery(state: AppState, resolver: DiscoveryConfig) {
                     if controller.live.is_some() {
                         return;
                     }
-                    let (run_record, snapshot) =
-                        reset_runtime(&state.runtime, &state.config, FeedMode::Live).await;
-                    if state.journal.send(run_record).await.is_err()
-                        || state
-                            .journal
-                            .send(JournalRecord::Mapping {
-                                schema: 2,
-                                mapping: live.mapping.clone(),
-                            })
-                            .await
-                            .is_err()
+                    if state
+                        .journal
+                        .send(JournalRecord::Mapping {
+                            schema: 2,
+                            mapping: live.mapping.clone(),
+                        })
+                        .await
+                        .is_err()
                     {
                         tracing::error!(
                             "journal worker stopped while saving discovered market mapping"
                         );
                         return;
                     }
+                    controller.live = Some(live.clone());
+                    controller.discovery = MappingStatus::Ready;
+                    if controller.environment != Environment::Devnet
+                        || controller.run_mode != RunMode::Live
+                    {
+                        tracing::info!(
+                            environment = ?controller.environment,
+                            run_mode = ?controller.run_mode,
+                            "discovered live mapping is waiting for a compatible session"
+                        );
+                        return;
+                    }
+                    let (run_record, snapshot) =
+                        reset_runtime(&state.runtime, &state.config, FeedMode::Live).await;
+                    if state.journal.send(run_record).await.is_err() {
+                        tracing::error!("journal worker stopped while starting discovered feed");
+                        return;
+                    }
                     match spawn_live_feeds(
                         state.runtime.clone(),
                         state.snapshots.clone(),
                         state.journal.clone(),
-                        live.clone(),
+                        live,
                     ) {
                         Ok(workers) => {
                             controller.workers = workers;
-                            controller.live = Some(live);
                             controller.mode = FeedMode::Live;
-                            controller.discovery = MappingStatus::Ready;
                             let _ = state.snapshots.send(snapshot);
                             tracing::info!(
                                 "discovered and activated a TxLINE-to-Pascal market mapping"
@@ -726,6 +1405,12 @@ async fn reset_runtime(
     runtime.engine.set_killed(killed);
     runtime.feed_mode = feed_mode;
     runtime.feed_status = feed_status_for(feed_mode);
+    runtime.replay.event_index = 0;
+    runtime.replay.status = if runtime.replay.total_events == 0 {
+        ReplayStatus::Unavailable
+    } else {
+        ReplayStatus::Paused
+    };
     let run_id = runtime.engine.run_id;
     let snapshot = runtime.snapshot();
     (

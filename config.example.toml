@@ -13,6 +13,6 @@ max_orders_per_minute = 60
 max_drawdown_micros = 15000000
 feed_stale_after_ms = 2500
 
-[paper]
+[simulation]
 acknowledgement_delay_ns = 2000000
 taker_fee_rate_micros = 1000

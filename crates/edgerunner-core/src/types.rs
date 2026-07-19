@@ -18,6 +18,7 @@ pub enum Side {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderMode {
+    #[serde(rename = "simulated", alias = "paper")]
     Paper,
     Live,
 }

@@ -10,6 +10,7 @@ pub struct BackendConfig {
     pub decision_history: usize,
     pub strategy: DislocationConfig,
     pub risk: RiskConfig,
+    #[serde(rename = "simulation", alias = "paper")]
     pub paper: PaperConfig,
 }
 

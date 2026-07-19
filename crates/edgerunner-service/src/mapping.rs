@@ -19,6 +19,10 @@ pub struct DiscoveryConfig {
 #[derive(Clone)]
 pub struct ResolvedLiveFeed {
     pub mapping: MarketMapping,
+    pub event_label: String,
+    pub contract_label: String,
+    pub market_period: String,
+    pub expected_event_start_time_ms: Option<u64>,
     pub txline_origin: String,
     pub api_token: String,
     pub pascal_ws: String,
@@ -83,6 +87,10 @@ impl DiscoveryConfig {
                     let home = home_participant(&fixture);
                     let away = away_participant(&fixture);
                     return Ok(ResolvedLiveFeed {
+                        event_label: format!("{home} vs {away}"),
+                        contract_label: market.market_description.clone(),
+                        market_period: market.market_period.clone(),
+                        expected_event_start_time_ms: market.expected_event_start_time_ms,
                         mapping: MarketMapping {
                             fixture_id: fixture.fixture_id,
                             fixture_label: format!("{home} vs {away}"),

@@ -1,6 +1,6 @@
 # EdgeRunner
 
-EdgeRunner is a deterministic, low-latency trading engine for sports prediction markets. It consumes TxLINE fair probabilities and a venue L2 order book, evaluates a fixed-point dislocation strategy, applies inline risk gates, and sends approved intents to a paper execution venue.
+EdgeRunner is a deterministic, low-latency trading engine for sports prediction markets. It consumes TxLINE fair probabilities and a venue L2 order book, evaluates a fixed-point dislocation strategy, applies inline risk gates, and sends approved intents to a simulated execution venue.
 
 The service only processes real market data. With a complete TxLINE and Pascal configuration it records the live streams to a journal; without that configuration it starts in an explicit inactive state and never invents prices, books, or score updates.
 
@@ -15,7 +15,7 @@ Pascal L2 WS ------> normalized events --+             |                    |
                                                         +--> SSE dashboard
 ```
 
-- `edgerunner-core`: fixed-point types, pure strategy contract, risk engine, paper venue, journal, replay, and latency histograms.
+- `edgerunner-core`: fixed-point types, pure strategy contract, risk engine, simulated venue, journal, replay, and latency histograms.
 - `edgerunner-adapters`: TxLINE SSE and stateful Pascal L2 WebSocket adapters.
 - `edgerunner-service`: CLI, live-feed supervision, append-only journal worker, Axum API, SSE state, and static UI hosting.
 - `web`: responsive React operator terminal.
@@ -50,7 +50,7 @@ The Rust service then hosts the built UI at `http://127.0.0.1:8080`.
 ## Commands
 
 ```bash
-# Live TxLINE SSE + Pascal L2, with paper execution
+# Live TxLINE SSE + Pascal L2, with simulated execution
 cargo run -p edgerunner -- serve \
   --journal data/runs/latest.jsonl \
   --config config.example.toml
@@ -72,7 +72,7 @@ cargo run --release -p edgerunner -- probe \
   --url https://data.pascal.trade/api/v1/time
 ```
 
-### Live Feeds, Recorded Replay, Paper Execution
+### Live Feeds, Recorded Replay, Simulated Execution
 
 Use TxLINE devnet's free tier to get a real odds feed. TxLINE requires a signed devnet
 subscription from the wallet that will own the credentials. The official
@@ -107,7 +107,7 @@ come from that public WebSocket.
 
 The service loads `.env` at startup, with process environment variables taking precedence. The
 dashboard control toggles only between `live` and `inactive`; it never creates a fallback market feed.
-Discovery automatically activates matching real workers and opens a new paper run. The selected
+Discovery automatically activates matching real workers and opens a new simulated run. The selected
 fixture, Pascal symbol, and TxLINE outcome are appended to the journal before market events, so replay
 uses the recorded mapping rather than a fresh lookup. You can also override the market label or Pascal
 symbol with `--live-feeds --market ... --pascal-symbol ...`.
@@ -129,10 +129,13 @@ For submitted intents carrying TxLINE `messageId` and `ts` provenance, a backgro
 
 - `GET /api/health`: liveness and execution mode.
 - `GET /api/ready`: trading readiness; returns 503 when killed or a feed is unavailable.
-- `GET /api/config`: effective non-secret strategy, risk, and paper-venue configuration.
+- `GET /api/config`: effective non-secret strategy, risk, and simulation-venue configuration.
 - `GET /api/snapshot`: current engine, market, latency, decision, and fill state.
 - `GET /api/events`: SSE stream of snapshots.
 - `GET /api/metrics`: Prometheus text metrics.
+- `GET /api/session`: current Devnet/Mainnet environment, Live/Replay mode, and replay progress.
+- `POST /api/session`: switch environment or run mode. Mainnet is represented as an environment only until a mainnet adapter is configured.
+- `POST /api/replay`: play, pause, reset, seek, or change speed for the selected journal.
 - `GET /api/feed-mode`: configured live-feed availability and current `live`/`inactive` state.
 - `POST /api/feed-mode`: start or stop the real live feeds.
 - `POST /api/kill`: activate the risk kill switch.

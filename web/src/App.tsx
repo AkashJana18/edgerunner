@@ -7,18 +7,29 @@ import {
   CircleGauge,
   Clock3,
   DatabaseZap,
+  FastForward,
+  Globe2,
+  Radio,
   Pause,
   Play,
+  RotateCcw,
   RefreshCw,
   ServerCog,
   ShieldCheck,
-  ToggleLeft,
-  ToggleRight,
   WifiOff,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Decision, FeedMode, FeedModeState, FeedStatus, MarketState, Snapshot } from "./types";
+import { useCallback, useEffect, useState } from "react";
+import type { ReactNode } from "react";
+import type {
+  Decision,
+  Environment,
+  FeedStatus,
+  MarketState,
+  RunMode,
+  SessionState,
+  Snapshot,
+} from "./types";
 
 type LoadState = "loading" | "ready" | "error";
 
@@ -32,8 +43,9 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
   const [controlError, setControlError] = useState("");
-  const [feedMode, setFeedMode] = useState<FeedModeState | null>(null);
-  const [feedBusy, setFeedBusy] = useState(false);
+  const [session, setSession] = useState<SessionState | null>(null);
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const [replayBusy, setReplayBusy] = useState(false);
   const [tab, setTab] = useState<"decisions" | "fills">("decisions");
   const [history, setHistory] = useState<number[]>([]);
 
@@ -41,16 +53,16 @@ function App() {
     setLoadState("loading");
     setError("");
     try {
-      const [snapshotResponse, feedModeResponse] = await Promise.all([
+      const [snapshotResponse, sessionResponse] = await Promise.all([
         fetch(`${API}/api/snapshot`),
-        fetch(`${API}/api/feed-mode`),
+        fetch(`${API}/api/session`),
       ]);
       if (!snapshotResponse.ok) throw new Error(`API returned ${snapshotResponse.status}`);
-      if (!feedModeResponse.ok) throw new Error(`Feed source returned ${feedModeResponse.status}`);
+      if (!sessionResponse.ok) throw new Error(`Session API returned ${sessionResponse.status}`);
       const data = (await snapshotResponse.json()) as Snapshot;
-      const source = (await feedModeResponse.json()) as FeedModeState;
+      const source = (await sessionResponse.json()) as SessionState;
       setSnapshot(data);
-      setFeedMode(source);
+      setSession(source);
       setLoadState("ready");
     } catch (cause) {
       setLoadState("error");
@@ -79,11 +91,11 @@ function App() {
 
   useEffect(() => {
     if (loadState !== "ready") return;
-    const refreshFeedMode = async () => {
-      const response = await fetch(`${API}/api/feed-mode`);
-      if (response.ok) setFeedMode((await response.json()) as FeedModeState);
+    const refreshSession = async () => {
+      const response = await fetch(`${API}/api/session`);
+      if (response.ok) setSession((await response.json()) as SessionState);
     };
-    const interval = window.setInterval(() => void refreshFeedMode(), 5_000);
+    const interval = window.setInterval(() => void refreshSession(), 1_000);
     return () => window.clearInterval(interval);
   }, [loadState]);
 
@@ -103,33 +115,58 @@ function App() {
     }
   };
 
-  const setFeedSource = async (mode: FeedMode) => {
-    setFeedBusy(true);
+  const changeSession = async (patch: { environment?: Environment; run_mode?: RunMode }) => {
+    setSessionBusy(true);
     setControlError("");
     try {
-      const response = await fetch(`${API}/api/feed-mode`, {
+      const response = await fetch(`${API}/api/session`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           "x-api-token": CONTROL_TOKEN,
         },
-        body: JSON.stringify({ mode }),
+        body: JSON.stringify(patch),
       });
-      const body = (await response.json().catch(() => null)) as FeedModeState | { error?: string } | null;
+      const body = (await response.json().catch(() => null)) as SessionState | { error?: string } | null;
       if (!response.ok) {
-        throw new Error(body && "error" in body ? body.error : "Feed source change was rejected.");
+        throw new Error(body && "error" in body ? body.error : "Session change was rejected.");
       }
-      setFeedMode(body as FeedModeState);
+      setSession(body as SessionState);
       setHistory([]);
     } catch (cause) {
-      setControlError(cause instanceof Error ? cause.message : "Feed source change failed.");
+      setControlError(cause instanceof Error ? cause.message : "Session change failed.");
     } finally {
-      setFeedBusy(false);
+      setSessionBusy(false);
+    }
+  };
+
+  const replayCommand = async (command: Record<string, unknown>) => {
+    setReplayBusy(true);
+    setControlError("");
+    try {
+      const response = await fetch(`${API}/api/replay`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-token": CONTROL_TOKEN,
+        },
+        body: JSON.stringify(command),
+      });
+      const body = (await response.json().catch(() => null)) as SessionState | { error?: string } | null;
+      if (!response.ok) {
+        throw new Error(body && "error" in body ? body.error : "Replay command was rejected.");
+      }
+      setSession(body as SessionState);
+      if (command.action === "reset" || command.action === "seek") setHistory([]);
+    } catch (cause) {
+      setControlError(cause instanceof Error ? cause.message : "Replay command failed.");
+    } finally {
+      setReplayBusy(false);
     }
   };
 
   if (loadState === "loading") return <LoadingView />;
-  if (loadState === "error" || !snapshot) {
+  if (loadState === "error" || !snapshot || !session) {
     return <ErrorView message={error} onRetry={() => void load()} />;
   }
 
@@ -139,11 +176,11 @@ function App() {
       {!connected && <OfflineBanner />}
       <Header
         snapshot={snapshot}
+        session={session}
         busy={controlBusy}
-        feedMode={feedMode}
-        feedBusy={feedBusy}
+        sessionBusy={sessionBusy}
         onControl={setKilled}
-        onFeedMode={setFeedSource}
+        onSession={changeSession}
       />
       <main className="mx-auto w-full max-w-[1440px] px-4 py-5 md:px-6 lg:px-8">
         {controlError && (
@@ -152,16 +189,19 @@ function App() {
             {controlError}
           </div>
         )}
-        <StatusStrip snapshot={snapshot} market={market} feedMode={feedMode} />
+        <StatusStrip snapshot={snapshot} market={market} session={session} />
+        {session.run_mode === "replay" && (
+          <ReplayToolbar session={session} busy={replayBusy} onCommand={replayCommand} />
+        )}
         <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1.5fr)_minmax(320px,0.75fr)]">
           <div className="min-w-0 space-y-5">
-            <MarketPanel market={market} history={history} />
+            <MarketPanel market={market} display={session.market} history={history} />
             <ActivityPanel snapshot={snapshot} tab={tab} onTab={setTab} />
           </div>
           <aside className="min-w-0 space-y-5">
             <LatencyPanel snapshot={snapshot} />
-            <RiskPanel snapshot={snapshot} market={market} feedMode={feedMode} />
-            <RunPanel snapshot={snapshot} feedMode={feedMode} />
+            <RiskPanel snapshot={snapshot} market={market} session={session} />
+            <RunPanel snapshot={snapshot} session={session} />
           </aside>
         </div>
       </main>
@@ -171,22 +211,21 @@ function App() {
 
 function Header({
   snapshot,
+  session,
   busy,
-  feedMode,
-  feedBusy,
+  sessionBusy,
   onControl,
-  onFeedMode,
+  onSession,
 }: {
   snapshot: Snapshot;
+  session: SessionState;
   busy: boolean;
-  feedMode: FeedModeState | null;
-  feedBusy: boolean;
+  sessionBusy: boolean;
   onControl: (killed: boolean) => Promise<void>;
-  onFeedMode: (mode: FeedMode) => Promise<void>;
+  onSession: (patch: { environment?: Environment; run_mode?: RunMode }) => Promise<void>;
 }) {
-  const live = feedMode?.mode === "live";
-  const feedSwitchDisabled = feedBusy || (!live && !feedMode?.live_available);
-  const discoveryInProgress = feedMode?.mapping_status === "discovering";
+  const feedStatus = snapshot.feed_status.txline;
+  const liveReady = session.run_mode === "live" && session.live_available && feedStatus === "live";
   return (
     <header className="border-b border-border bg-surface">
       <div className="mx-auto flex min-h-16 w-full max-w-[1440px] flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-6 lg:px-8">
@@ -202,29 +241,27 @@ function Header({
             <p className="truncate text-xs text-secondary">Deterministic execution core</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-2 border border-border bg-background px-2 py-1.5">
+        <div className="flex flex-wrap items-center justify-end gap-4">
+          <SessionSelector
+            value={session.environment}
+            options={["devnet", "mainnet"]}
+            disabled={sessionBusy}
+            onChange={(environment) => void onSession({ environment })}
+          />
+          <SessionSelector
+            value={session.run_mode}
+            options={["live", "replay"]}
+            disabled={sessionBusy}
+            onChange={(run_mode) => void onSession({ run_mode })}
+          />
+          <div className="feed-status-control" title={session.run_mode === "replay" ? "Market events are coming from the selected recording" : "Live market feed status"}>
+            <Radio size={15} className={liveReady ? "text-success" : "text-muted"} aria-hidden="true" />
             <span className="text-xs text-secondary">TxLINE</span>
-            <button
-              type="button"
-              className={`feed-toggle ${live ? "feed-toggle-live" : ""}`}
-              role="switch"
-              aria-checked={live}
-              aria-label={live ? "Stop live feeds" : "Start live feeds"}
-              title={feedMode?.live_available ? (live ? "Stop live feeds" : "Start live feeds") : discoveryInProgress ? "Resolving a matching TxLINE fixture and Pascal market" : "Set TXLINE_API_TOKEN on the server to enable live data"}
-              disabled={feedSwitchDisabled}
-              aria-busy={feedBusy}
-              onClick={() => void onFeedMode(live ? "inactive" : "live")}
-            >
-              {live ? <ToggleRight size={22} aria-hidden="true" /> : <ToggleLeft size={22} aria-hidden="true" />}
-            </button>
-            <span className={`font-mono text-xs ${live ? "text-success" : "text-muted"}`}>
-              {feedBusy ? "SWITCHING" : live ? "LIVE" : feedMode?.live_available ? "OFF" : discoveryInProgress ? "DISCOVERING" : "SETUP"}
+            <span className={`font-mono text-xs ${liveReady ? "text-success" : "text-muted"}`}>
+              {session.run_mode === "replay" ? "REPLAY" : session.live_available ? feedStatus.toUpperCase() : session.mapping_status.toUpperCase()}
             </span>
           </div>
-          <span className="hidden border border-border bg-background px-3 py-2 font-mono text-xs text-secondary sm:inline-flex">
-            {snapshot.mode.toUpperCase()}
-          </span>
+
           <button
             type="button"
             className={`control-button ${snapshot.killed ? "control-button-resume" : "control-button-kill"}`}
@@ -241,38 +278,161 @@ function Header({
   );
 }
 
-function StatusStrip({ snapshot, market, feedMode }: { snapshot: Snapshot; market?: MarketState; feedMode: FeedModeState | null }) {
-  const feedDetail = feedMode?.mode === "live"
-    ? "TxLINE SSE"
-    : feedMode?.mapping_status === "discovering"
-      ? "resolving market"
-      : "feeds inactive";
+function SessionSelector<T extends Environment | RunMode>({
+  label,
+  icon,
+  value,
+  options,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  icon: ReactNode;
+  value: T;
+  options: readonly T[];
+  disabled: boolean;
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div className="session-selector">
+      <span className="session-selector-label">{icon}{label}</span>
+      <div className="segmented segmented-compact" role="tablist" aria-label={label}>
+        {options.map((option) => (
+          <button
+            key={option}
+            type="button"
+            role="tab"
+            aria-selected={value === option}
+            disabled={disabled}
+            onClick={() => onChange(option)}
+          >
+            {option.toUpperCase()}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ReplayToolbar({
+  session,
+  busy,
+  onCommand,
+}: {
+  session: SessionState;
+  busy: boolean;
+  onCommand: (command: Record<string, unknown>) => Promise<void>;
+}) {
+  const replay = session.replay;
+  const unavailable = replay.status === "unavailable";
+  const playing = replay.status === "playing";
+  const progress = replay.total_events === 0 ? 0 : (replay.event_index / replay.total_events) * 100;
+  return (
+    <section className="panel replay-toolbar" aria-labelledby="replay-heading">
+      <div className="replay-toolbar-copy">
+        <div className="flex items-center gap-2">
+          <FastForward size={16} className="text-secondary" aria-hidden="true" />
+          <p className="eyebrow">Replay control</p>
+        </div>
+        <h2 id="replay-heading" className="mt-1 text-base font-semibold">Recorded session</h2>
+        <p className="mt-1 truncate text-xs text-muted" title={replay.journal}>{replay.journal}</p>
+      </div>
+      <div className="replay-toolbar-controls">
+        <button
+          type="button"
+          className="secondary-button"
+          aria-label={playing ? "Pause replay" : "Play replay"}
+          disabled={busy || unavailable}
+          aria-busy={busy}
+          onClick={() => void onCommand({ action: playing ? "pause" : "play" })}
+        >
+          {playing ? <Pause size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}
+          {playing ? "Pause" : "Play"}
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          aria-label="Reset replay"
+          disabled={busy || unavailable}
+          onClick={() => void onCommand({ action: "reset" })}
+        >
+          <RotateCcw size={15} aria-hidden="true" />
+          Reset
+        </button>
+        <label className="replay-speed">
+          <span>Speed</span>
+          <select
+            value={replay.speed}
+            disabled={busy || unavailable}
+            aria-label="Replay speed"
+            onChange={(event) => void onCommand({ action: "set_speed", speed: Number(event.target.value) })}
+          >
+            {[0.5, 1, 2, 5, 10].map((speed) => <option key={speed} value={speed}>{speed}×</option>)}
+          </select>
+        </label>
+        <span className="replay-counter font-mono" aria-live="polite">
+          {replay.event_index.toLocaleString()} / {replay.total_events.toLocaleString()}
+        </span>
+      </div>
+      <div className="replay-progress-row">
+        <input
+          type="range"
+          min="0"
+          max={replay.total_events}
+          value={replay.event_index}
+          disabled={busy || unavailable || replay.total_events === 0}
+          aria-label="Replay position"
+          onChange={(event) => void onCommand({ action: "seek", event_index: Number(event.target.value) })}
+        />
+        <span className={`replay-status replay-status-${replay.status}`}>{replay.status}</span>
+        <span className="replay-progress-value font-mono">{progress.toFixed(0)}%</span>
+      </div>
+      {unavailable && (
+        <p className="replay-empty" role="status">No recorded market events are available at {replay.journal}.</p>
+      )}
+    </section>
+  );
+}
+
+function StatusStrip({ snapshot, market, session }: { snapshot: Snapshot; market?: MarketState; session: SessionState }) {
+  const feedDetail = session.run_mode === "replay"
+    ? "recorded journal"
+    : session.live_available
+      ? "TxLINE SSE"
+      : session.mapping_status === "discovering"
+        ? "resolving market"
+        : "live source unavailable";
+  const opportunity = grossOpportunity(market);
+  const pnlTone = (market?.pnl_micros ?? 0) < 0 ? "text-danger" : "";
   const metrics = [
-    { label: "Fair value", value: formatProbability(market?.fair_value), detail: feedDetail, icon: DatabaseZap },
-    { label: "Best market", value: `${formatProbability(market?.best_bid)} / ${formatProbability(market?.best_ask)}`, detail: "bid / ask", icon: Activity },
-    { label: "Position", value: `${market?.position ?? 0}`, detail: "contracts", icon: CircleGauge },
-    { label: "Mark-to-market", value: formatMoney(market?.pnl_micros), detail: `${compact(snapshot.processed_events)} events`, icon: ServerCog },
+    { label: "Fair value", value: formatProbability(market?.fair_value), detail: feedDetail, icon: DatabaseZap, tone: "" },
+    { label: "Best market", value: `${formatProbability(market?.best_bid)} / ${formatProbability(market?.best_ask)}`, detail: "bid / ask", icon: Activity, tone: "" },
+    { label: "Gross edge", value: formatProbability(opportunity.edge), detail: opportunity.detail, icon: Zap, tone: opportunity.tone },
+    { label: "Position", value: `${market?.position ?? 0}`, detail: "contracts", icon: CircleGauge, tone: "" },
+    { label: "Mark-to-market", value: formatMoney(market?.pnl_micros), detail: "simulated P&L", icon: ServerCog, tone: pnlTone },
+    { label: "p99 latency", value: `${snapshot.latency.p99_us} μs`, detail: `${compact(snapshot.latency.samples)} evaluations`, icon: Clock3, tone: "" },
   ];
   return (
-    <section className="grid grid-cols-2 border border-border bg-surface lg:grid-cols-4" aria-label="Engine status">
-      {metrics.map(({ label, value, detail, icon: Icon }) => (
+    <section className="grid grid-cols-2 gap-px border border-border bg-border md:grid-cols-3 xl:grid-cols-6" aria-label="Engine status">
+      {metrics.map(({ label, value, detail, icon: Icon, tone }) => (
         <div key={label} className="metric-cell">
           <div className="flex items-center justify-between gap-2 text-secondary">
             <span className="text-xs font-medium">{label}</span>
             <Icon size={15} aria-hidden="true" />
           </div>
-          <div className="mt-3 truncate font-mono text-lg font-semibold tabular-nums">{value}</div>
-          <div className="mt-1 text-xs text-muted">{detail}</div>
+          <div className={`mt-3 truncate font-mono text-lg font-semibold tabular-nums ${tone}`}>{value}</div>
+          <div className={`mt-1 truncate text-xs ${tone || "text-muted"}`}>{detail}</div>
         </div>
       ))}
     </section>
   );
 }
 
-function MarketPanel({ market, history }: { market?: MarketState; history: number[] }) {
+function MarketPanel({ market, display, history }: { market?: MarketState; display: SessionState["market"]; history: number[] }) {
   if (!market) {
     return <EmptyPanel title="Waiting for a matched market" detail="The service is resolving live TxLINE and Pascal market metadata." />;
   }
+  const readable = display ?? humanizeMarketSymbol(market.market);
   const max = Math.max(...history, 1);
   const min = Math.min(...history, max);
   return (
@@ -280,11 +440,12 @@ function MarketPanel({ market, history }: { market?: MarketState; history: numbe
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Primary market</p>
-          <h2 id="market-heading" className="mt-1 text-base font-semibold">{market.market}</h2>
+          <h2 id="market-heading" className="mt-1 text-base font-semibold">{readable.event}</h2>
+          <p className="mt-1 text-sm text-secondary">{readable.contract}</p>
         </div>
         <div className="text-right">
           <p className="font-mono text-sm font-semibold">{market.phase || "PRE"} {market.score_home}-{market.score_away}</p>
-          <p className="mt-1 text-xs text-muted">{market.market}</p>
+          <p className="mt-1 text-xs text-muted">{friendlyPeriod(readable.period)}</p>
         </div>
       </div>
       <div className="grid gap-4 p-4 md:grid-cols-[minmax(0,1fr)_220px] md:p-5">
@@ -312,7 +473,10 @@ function MarketPanel({ market, history }: { market?: MarketState; history: numbe
           <div className="mt-2 flex justify-between font-mono text-[12px] text-muted"><span>-14s</span><span>now</span></div>
         </div>
         <div className="border-t border-border pt-4 md:border-l md:border-t-0 md:pl-4 md:pt-0">
-          <p className="eyebrow">Top of book</p>
+          <div className="flex items-center justify-between gap-2">
+            <p className="eyebrow">Best available prices</p>
+            <p className="text-[11px] text-muted">Price / size</p>
+          </div>
           <BookRow label="Ask" price={market.best_ask} size={market.ask_size} side="ask" />
           <BookRow label="Bid" price={market.best_bid} size={market.bid_size} side="bid" />
           <div className="mt-5 grid grid-cols-2 gap-2 text-xs">
@@ -323,6 +487,30 @@ function MarketPanel({ market, history }: { market?: MarketState; history: numbe
       </div>
     </section>
   );
+}
+
+function humanizeMarketSymbol(symbol: string): NonNullable<SessionState["market"]> {
+  const countries: Record<string, string> = {
+    ARG: "Argentina",
+    ESP: "Spain",
+    FRA: "France",
+  };
+  const matchup = symbol.match(/_(?:[A-Z]+_)?([A-Z]{3})([A-Z]{3})_/);
+  const home = matchup ? countries[matchup[1]] ?? matchup[1] : "Primary";
+  const away = matchup ? countries[matchup[2]] ?? matchup[2] : "market";
+  const teamTotal = symbol.match(/_([A-Z]{3})TT\./);
+  const team = teamTotal ? countries[teamTotal[1]] ?? teamTotal[1] : null;
+  const contract = symbol.endsWith("ML.DRAW")
+    ? "Draw"
+    : team
+      ? `${team} team total`
+      : "Selected contract";
+  return { event: `${home} vs ${away}`, contract, period: "Regulation time", starts_at_ms: null };
+}
+
+function friendlyPeriod(period: string) {
+  if (/reg(?:ulation)?\s*time/i.test(period)) return "Regulation time";
+  return period.replace(/\s*-\s*/g, " · ");
 }
 
 function BookRow({ label, price, size, side }: { label: string; price: number | null; size: number; side: "bid" | "ask" }) {
@@ -379,7 +567,7 @@ function DecisionTable({ decisions }: { decisions: Decision[] }) {
 }
 
 function FillTable({ snapshot }: { snapshot: Snapshot }) {
-  if (snapshot.fills.length === 0) return <EmptyPanel title="No fills yet" detail="Paper fills appear after an intent crosses visible depth." inline />;
+  if (snapshot.fills.length === 0) return <EmptyPanel title="No fills yet" detail="Simulated fills appear after an intent crosses visible depth." inline />;
   return (
     <div className="table-scroll">
       <table>
@@ -405,32 +593,39 @@ function LatencyPanel({ snapshot }: { snapshot: Snapshot }) {
     ["p99", snapshot.latency.p99_us],
     ["max", snapshot.latency.max_us],
   ] as const;
-  const max = Math.max(snapshot.latency.max_us, 1);
+  const ceiling = 100;
   return (
     <section className="panel" aria-labelledby="latency-heading">
       <div className="panel-heading">
         <div><p className="eyebrow">Hot path</p><h2 id="latency-heading" className="mt-1 text-base font-semibold">Decision compute latency</h2></div>
         <Clock3 size={18} className="text-secondary" aria-hidden="true" />
       </div>
-      <div className="space-y-4 p-4 md:p-5">
-        {values.map(([label, value]) => (
-          <div key={label}>
-            <div className="flex items-baseline justify-between gap-3 text-xs"><span className="text-secondary">{label}</span><strong className="font-mono text-sm">{value} us</strong></div>
-            <div className="latency-track"><span style={{ width: `${Math.max(4, (value / max) * 100)}%` }} /></div>
-          </div>
-        ))}
-        <p className="border-t border-border pt-3 text-xs text-muted">{snapshot.latency.samples.toLocaleString()} strategy evaluations</p>
+      <div className="latency-chart p-4 md:p-5">
+        <div className="latency-grid" aria-label="Latency values on a fixed 0 to 100 microsecond scale">
+          {[0, 25, 50, 75, 100].map((tick) => <span key={tick} style={{ left: `${tick}%` }} aria-hidden="true" />)}
+          {values.map(([label, value]) => {
+            const width = Math.min(100, Math.max(2, (value / ceiling) * 100));
+            return (
+              <div key={label} className="latency-row">
+                <span className="latency-label">{label}</span>
+                <div className="latency-track"><span style={{ width: `${width}%` }} /></div>
+                <strong className="font-mono text-sm">{value} μs{value > ceiling ? " +" : ""}</strong>
+              </div>
+            );
+          })}
+        </div>
       </div>
     </section>
   );
 }
 
-function RiskPanel({ snapshot, market, feedMode }: { snapshot: Snapshot; market?: MarketState; feedMode: FeedModeState | null }) {
+function RiskPanel({ snapshot, market, session }: { snapshot: Snapshot; market?: MarketState; session: SessionState }) {
   const liveFeeds = Object.values(snapshot.feed_status).every((status) => status === "live");
-  const inactive = feedMode?.mode === "inactive";
+  const replayHasData = session.run_mode === "replay" && snapshot.processed_events > 0;
+  const feedOkay = session.run_mode === "replay" ? replayHasData : liveFeeds;
   const states = [
     { label: "Kill switch", ok: !snapshot.killed, text: snapshot.killed ? "ACTIVE" : "armed" },
-    { label: "Feed freshness", ok: liveFeeds, text: inactive ? "inactive" : liveFeeds ? "within limit" : "unavailable" },
+    { label: "Feed freshness", ok: feedOkay, text: session.run_mode === "replay" ? (replayHasData ? "recorded" : "waiting") : liveFeeds ? "within limit" : "unavailable" },
     { label: "Market circuit", ok: !market?.danger && !market?.suspended, text: market?.danger || market?.suspended ? "blocked" : "clear" },
     { label: "Position limit", ok: Math.abs(market?.position ?? 0) < 250, text: `${Math.abs(market?.position ?? 0)} / 250` },
   ];
@@ -454,18 +649,19 @@ function RiskPanel({ snapshot, market, feedMode }: { snapshot: Snapshot; market?
   );
 }
 
-function RunPanel({ snapshot, feedMode }: { snapshot: Snapshot; feedMode: FeedModeState | null }) {
+function RunPanel({ snapshot, session }: { snapshot: Snapshot; session: SessionState }) {
+  const replaySource = session.run_mode === "replay";
   return (
     <section className="panel" aria-labelledby="run-heading">
       <div className="panel-heading"><div><p className="eyebrow">Runtime</p><h2 id="run-heading" className="mt-1 text-base font-semibold">Run identity</h2></div><ServerCog size={18} className="text-secondary" aria-hidden="true" /></div>
       <dl className="grid grid-cols-[92px_1fr] gap-x-3 gap-y-3 p-4 text-xs md:p-5">
         <dt className="text-muted">Run ID</dt><dd className="truncate font-mono" title={snapshot.run_id}>{snapshot.run_id}</dd>
-        <dt className="text-muted">Mode</dt><dd className="font-mono uppercase">{snapshot.mode}</dd>
-        <dt className="text-muted">Source</dt><dd className={`font-mono uppercase ${feedMode?.mode === "live" ? "text-success" : "text-secondary"}`}>{feedMode?.mode ?? "unknown"}</dd>
+        <dt className="text-muted">Environment</dt><dd className="font-mono uppercase">{session.environment}</dd>
+        <dt className="text-muted">Run mode</dt><dd className={`font-mono uppercase ${session.run_mode === "live" ? "text-success" : "text-secondary"}`}>{session.run_mode}</dd>
         <dt className="text-muted">Events</dt><dd className="font-mono">{snapshot.processed_events.toLocaleString()}</dd>
         <dt className="text-muted">Rejected</dt><dd className="font-mono">{snapshot.rejected_orders.toLocaleString()}</dd>
-        <dt className="text-muted">TxLINE</dt><dd><FeedBadge status={snapshot.feed_status.txline} /></dd>
-        <dt className="text-muted">Pascal</dt><dd><FeedBadge status={snapshot.feed_status.pascal} /></dd>
+        <dt className="text-muted">TxLINE</dt><dd>{replaySource ? <span className="feed-badge feed-replay">replay</span> : <FeedBadge status={snapshot.feed_status.txline} />}</dd>
+        <dt className="text-muted">Pascal</dt><dd>{replaySource ? <span className="feed-badge feed-replay">replay</span> : <FeedBadge status={snapshot.feed_status.pascal} />}</dd>
       </dl>
     </section>
   );
@@ -520,6 +716,19 @@ function formatProbability(value?: number | null) {
 function formatSpread(market?: MarketState) {
   if (market?.best_ask == null || market.best_bid == null) return "-";
   return `${((market.best_ask - market.best_bid) / 10_000).toFixed(2)}%`;
+}
+
+function grossOpportunity(market?: MarketState) {
+  if (market?.fair_value == null || market.best_bid == null || market.best_ask == null) {
+    return { edge: null, detail: "Waiting for both feeds", tone: "" };
+  }
+  const buyEdge = market.fair_value - market.best_ask;
+  const sellEdge = market.best_bid - market.fair_value;
+  const edge = Math.max(buyEdge, sellEdge);
+  if (edge <= 0) return { edge: 0, detail: "No actionable edge", tone: "" };
+  return buyEdge >= sellEdge
+    ? { edge: buyEdge, detail: "BUY at best ask", tone: "text-success" }
+    : { edge: sellEdge, detail: "SELL at best bid", tone: "text-danger" };
 }
 
 function formatLatency(ns: number) {

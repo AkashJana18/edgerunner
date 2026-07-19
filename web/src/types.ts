@@ -2,6 +2,9 @@ export type FeedStatus = "connecting" | "live" | "stale" | "disconnected";
 export type FeedMode = "inactive" | "live";
 export type MappingStatus = "unavailable" | "discovering" | "ready";
 export type Side = "bid" | "ask";
+export type Environment = "devnet" | "mainnet";
+export type RunMode = "live" | "replay";
+export type ReplayStatus = "paused" | "playing" | "complete" | "unavailable";
 
 export interface MarketState {
   market: string;
@@ -54,7 +57,7 @@ export interface Fill {
 
 export interface Snapshot {
   run_id: string;
-  mode: "paper" | "live";
+  mode: "simulated" | "live";
   running: boolean;
   killed: boolean;
   feed_status: Record<string, FeedStatus>;
@@ -71,6 +74,31 @@ export interface Snapshot {
   processed_events: number;
   rejected_orders: number;
   last_update: string;
+}
+
+export interface ReplayState {
+  status: ReplayStatus;
+  event_index: number;
+  total_events: number;
+  speed: number;
+  journal: string;
+}
+
+export interface MarketDisplay {
+  event: string;
+  contract: string;
+  period: string;
+  starts_at_ms: number | null;
+}
+
+export interface SessionState {
+  environment: Environment;
+  run_mode: RunMode;
+  execution: "simulated";
+  live_available: boolean;
+  mapping_status: MappingStatus;
+  replay: ReplayState;
+  market: MarketDisplay | null;
 }
 
 export interface FeedModeState {
