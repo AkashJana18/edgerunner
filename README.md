@@ -7,78 +7,21 @@ The service only processes real market data. With a complete TxLINE and Pascal c
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph SOURCES["Live Market Sources"]
-        TX_HTTP["TxLINE Fixtures + Odds API"]
-        TX_SSE["TxLINE Fair-Value SSE"]
-        PASCAL_API["Pascal Market Catalogue"]
-        PASCAL_WS["Pascal L2 WebSocket"]
-    end
+flowchart LR
+    LIVE["TxLINE Fair Value<br/>+ Pascal Order Book"]
+    REPLAY["Recorded Journal"]
+    EVENTS["Normalized Market Events"]
+    ENGINE["Deterministic Engine<br/>State → Strategy → Risk → Simulated Execution"]
+    JOURNAL[("Decisions · Trades · Proofs")]
+    API["Snapshots · Metrics · Controls"]
+    UI["Operator Dashboard"]
 
-    subgraph CONTROL["Control Plane"]
-        MATCHER["Fixture + Outcome Matcher"]
-        SUPERVISOR["Live-Feed Supervisor"]
-        REPLAY["Deterministic Replay Controller"]
-    end
-
-    TX_HTTP --> MATCHER
-    PASCAL_API --> MATCHER
-    MATCHER -->|"MarketMapping"| SUPERVISOR
-
-    subgraph INGESTION["Normalized Event Boundary"]
-        TX_ADAPTER["TxLINE Adapter<br/>FairValue Events"]
-        PASCAL_ADAPTER["Pascal Adapter<br/>Book Events"]
-        EVENT_QUEUE["Bounded Event Channel"]
-    end
-
-    SUPERVISOR -.->|"starts"| TX_ADAPTER
-    SUPERVISOR -.->|"starts"| PASCAL_ADAPTER
-    TX_SSE --> TX_ADAPTER
-    PASCAL_WS --> PASCAL_ADAPTER
-    TX_ADAPTER --> EVENT_QUEUE
-    PASCAL_ADAPTER --> EVENT_QUEUE
-    REPLAY -->|"recorded events"| EVENT_QUEUE
-
-    subgraph CORE["Deterministic Hot Path · Single Writer · No Network or Disk Await"]
-        STATE["MarketState<br/>Sequence + Freshness Checks"]
-        STRATEGY["Mean-Reversion Strategy<br/>5% Entry · 1% Exit · Scale to Risk Capacity"]
-        RISK["Inline Risk Gates<br/>Kill · Stale · Circuit · Drawdown · Position · Notional · Rate"]
-        VENUE["Simulated Execution Venue<br/>Visible Depth + Fees"]
-        ACCOUNTING["Position Accounting<br/>Cost Basis · Holding Time · Realized PnL"]
-    end
-
-    EVENT_QUEUE --> STATE
-    STATE --> STRATEGY
-    STRATEGY --> RISK
-    RISK -->|"approved intent"| VENUE
-    VENUE --> ACCOUNTING
-    ACCOUNTING -->|"fill updates"| STATE
-
-    subgraph OUTPUTS["Persistence + Observability"]
-        JOURNAL[("Append-Only JSONL Journal<br/>Mapping · Event · Decision · Fill · Trade · Proof")]
-        PROOF["TxLINE Validation-Proof Worker"]
-        SNAPSHOTS["Snapshot Broadcast"]
-        API["Axum API<br/>REST · SSE · Prometheus"]
-        DASHBOARD["React Operator Dashboard"]
-    end
-
-    MATCHER -->|"mapping"| JOURNAL
-    TX_ADAPTER -->|"source event"| JOURNAL
-    PASCAL_ADAPTER -->|"source event"| JOURNAL
-    STRATEGY -->|"decision"| JOURNAL
-    VENUE -->|"fill + trade"| JOURNAL
-    RISK -->|"submitted intent provenance"| PROOF
-    PROOF -->|"validation proof"| JOURNAL
-    JOURNAL --> REPLAY
-
-    STATE --> SNAPSHOTS
-    ACCOUNTING --> SNAPSHOTS
-    SNAPSHOTS --> API
-    API -->|"SSE state"| DASHBOARD
-    DASHBOARD -->|"session · replay · kill controls"| API
-    API -.-> SUPERVISOR
-    API -.-> REPLAY
-    API -.-> RISK
+    LIVE --> EVENTS
+    REPLAY --> EVENTS
+    EVENTS --> ENGINE
+    ENGINE --> JOURNAL
+    ENGINE --> API
+    API --> UI
 ```
 
 Live and replay events share the same deterministic engine path; only the event source changes.
@@ -94,7 +37,7 @@ Prerequisites: Rust 1.95+, Node 24+, and npm 11+.
 
 ```bash
 # terminal 1
-cargo run -p edgerunner -- serve
+cargo run -p edgerunner -- serve --live-feeds --config config.example.toml
 
 # terminal 2
 cd web
@@ -107,6 +50,7 @@ npm run dev
 ```bash
 # Live TxLINE SSE + Pascal L2, with simulated execution
 cargo run -p edgerunner -- serve \
+  --live-feeds \
   --journal data/runs/latest.jsonl \
   --config config.example.toml
 
@@ -155,8 +99,19 @@ to the recorded fixture and outcome selection. This never falls back to generate
 fixture, internal market label, or Pascal symbol. `PASCAL_WS_URL` remains optional and defaults to
 `wss://data.pascal.trade/ws`.
 
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Getting started](docs/GETTING_STARTED.md)
+- [Configuration](docs/CONFIGURATION.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Strategy and risk](docs/STRATEGY.md)
+- [Journal and replay](docs/REPLAY.md)
+- [HTTP API](docs/API.md)
+- [Demo runbook](docs/DEMO.md)
 
 ## API
+
 | Endpoint | Description |
 |----------|-------------|
 | `GET /api/health` | Service health |
@@ -171,7 +126,6 @@ fixture, internal market label, or Pascal symbol. `PASCAL_WS_URL` remains option
 | `POST /api/feed-mode` | Start or stop live feeds |
 | `POST /api/kill` | Activate kill switch |
 | `POST /api/resume` | Resume execution |
----
 
 ## Verification
 
