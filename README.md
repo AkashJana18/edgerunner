@@ -6,21 +6,87 @@ The service only processes real market data. With a complete TxLINE and Pascal c
 
 ## Architecture
 
-```text
-TxLINE SSE --------> normalized events --+
-                                           +--> single-writer engine --> risk --> execution venue
-Pascal L2 WS ------> normalized events --+             |                    |
-                                                        +--> journal         +--> fills
-                                                        +--> metrics
-                                                        +--> SSE dashboard
+```mermaid
+flowchart TB
+    subgraph SOURCES["Live Market Sources"]
+        TX_HTTP["TxLINE Fixtures + Odds API"]
+        TX_SSE["TxLINE Fair-Value SSE"]
+        PASCAL_API["Pascal Market Catalogue"]
+        PASCAL_WS["Pascal L2 WebSocket"]
+    end
+
+    subgraph CONTROL["Control Plane"]
+        MATCHER["Fixture + Outcome Matcher"]
+        SUPERVISOR["Live-Feed Supervisor"]
+        REPLAY["Deterministic Replay Controller"]
+    end
+
+    TX_HTTP --> MATCHER
+    PASCAL_API --> MATCHER
+    MATCHER -->|"MarketMapping"| SUPERVISOR
+
+    subgraph INGESTION["Normalized Event Boundary"]
+        TX_ADAPTER["TxLINE Adapter<br/>FairValue Events"]
+        PASCAL_ADAPTER["Pascal Adapter<br/>Book Events"]
+        EVENT_QUEUE["Bounded Event Channel"]
+    end
+
+    SUPERVISOR -.->|"starts"| TX_ADAPTER
+    SUPERVISOR -.->|"starts"| PASCAL_ADAPTER
+    TX_SSE --> TX_ADAPTER
+    PASCAL_WS --> PASCAL_ADAPTER
+    TX_ADAPTER --> EVENT_QUEUE
+    PASCAL_ADAPTER --> EVENT_QUEUE
+    REPLAY -->|"recorded events"| EVENT_QUEUE
+
+    subgraph CORE["Deterministic Hot Path · Single Writer · No Network or Disk Await"]
+        STATE["MarketState<br/>Sequence + Freshness Checks"]
+        STRATEGY["Mean-Reversion Strategy<br/>5% Entry · 1% Exit · Scale to Risk Capacity"]
+        RISK["Inline Risk Gates<br/>Kill · Stale · Circuit · Drawdown · Position · Notional · Rate"]
+        VENUE["Simulated Execution Venue<br/>Visible Depth + Fees"]
+        ACCOUNTING["Position Accounting<br/>Cost Basis · Holding Time · Realized PnL"]
+    end
+
+    EVENT_QUEUE --> STATE
+    STATE --> STRATEGY
+    STRATEGY --> RISK
+    RISK -->|"approved intent"| VENUE
+    VENUE --> ACCOUNTING
+    ACCOUNTING -->|"fill updates"| STATE
+
+    subgraph OUTPUTS["Persistence + Observability"]
+        JOURNAL[("Append-Only JSONL Journal<br/>Mapping · Event · Decision · Fill · Trade · Proof")]
+        PROOF["TxLINE Validation-Proof Worker"]
+        SNAPSHOTS["Snapshot Broadcast"]
+        API["Axum API<br/>REST · SSE · Prometheus"]
+        DASHBOARD["React Operator Dashboard"]
+    end
+
+    MATCHER -->|"mapping"| JOURNAL
+    TX_ADAPTER -->|"source event"| JOURNAL
+    PASCAL_ADAPTER -->|"source event"| JOURNAL
+    STRATEGY -->|"decision"| JOURNAL
+    VENUE -->|"fill + trade"| JOURNAL
+    RISK -->|"submitted intent provenance"| PROOF
+    PROOF -->|"validation proof"| JOURNAL
+    JOURNAL --> REPLAY
+
+    STATE --> SNAPSHOTS
+    ACCOUNTING --> SNAPSHOTS
+    SNAPSHOTS --> API
+    API -->|"SSE state"| DASHBOARD
+    DASHBOARD -->|"session · replay · kill controls"| API
+    API -.-> SUPERVISOR
+    API -.-> REPLAY
+    API -.-> RISK
 ```
+
+Live and replay events share the same deterministic engine path; only the event source changes.
 
 - `edgerunner-core`: fixed-point types, pure strategy contract, risk engine, simulated venue, journal, replay, and latency histograms.
 - `edgerunner-adapters`: TxLINE SSE and stateful Pascal L2 WebSocket adapters.
 - `edgerunner-service`: CLI, live-feed supervision, append-only journal worker, Axum API, SSE state, and static UI hosting.
 - `web`: responsive React operator terminal.
-
-Detailed design notes are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Run Locally
 
@@ -35,17 +101,6 @@ cd web
 npm install
 npm run dev
 ```
-
-Open `http://127.0.0.1:5173`. The API listens on `http://127.0.0.1:8080`.
-
-For a production-style local build:
-
-```bash
-cd web && npm run build && cd ..
-cargo run --release -p edgerunner -- serve
-```
-
-The Rust service then hosts the built UI at `http://127.0.0.1:8080`.
 
 ## Commands
 
@@ -100,49 +155,23 @@ to the recorded fixture and outcome selection. This never falls back to generate
 fixture, internal market label, or Pascal symbol. `PASCAL_WS_URL` remains optional and defaults to
 `wss://data.pascal.trade/ws`.
 
-`PASCAL_WS_URL=wss://data.pascal.trade/ws` is Pascal's public market-data WebSocket and does not
-require credentials. If Pascal introduces private-market access for the selected product, add its
-credentials to the runtime environment rather than hard-coding them. All current Pascal book events
-come from that public WebSocket.
-
-The service loads `.env` at startup, with process environment variables taking precedence. The
-dashboard control toggles only between `live` and `inactive`; it never creates a fallback market feed.
-Discovery automatically activates matching real workers and opens a new simulated run. The selected
-fixture, Pascal symbol, and TxLINE outcome are appended to the journal before market events, so replay
-uses the recorded mapping rather than a fresh lookup. You can also override the market label or Pascal
-symbol with `--live-feeds --market ... --pascal-symbol ...`.
-
-TxLINE guest JWTs are obtained from `TXLINE_ORIGIN/auth/guest/start` whenever an SSE connection or
-proof lookup is opened. Do not persist `TXLINE_GUEST_JWT`; the activated `TXLINE_API_TOKEN` is sent
-on every TxLINE request, including guest-token acquisition, SSE, and validation.
-
-Each live journal event records its source (`txline` or `pascal`). TxLINE fair-value records require
-the upstream `messageId` and timestamp provenance, while the raw TxLINE validation proof is stored
-when an order is submitted. `replay` and `bench` consume those recorded events only and reject
-legacy journals without source provenance, incomplete TxLINE events, or journals missing either
-feed. This is the historical/replay path; it is deterministic and has no local event generator.
-
-Live-feed mode intentionally cannot place live orders. A Pascal order adapter should be enabled only after private-beta API access, signed-permit integration tests, and explicit non-zero capital limits exist.
-For submitted intents carrying TxLINE `messageId` and `ts` provenance, a background worker retrieves `/api/odds/validation` with bounded retries and appends the raw Merkle proof to the same run journal.
 
 ## API
-
-- `GET /api/health`: liveness and execution mode.
-- `GET /api/ready`: trading readiness; returns 503 when killed or a feed is unavailable.
-- `GET /api/config`: effective non-secret strategy, risk, and simulation-venue configuration.
-- `GET /api/snapshot`: current engine, market, latency, decision, and fill state.
-- `GET /api/events`: SSE stream of snapshots.
-- `GET /api/metrics`: Prometheus text metrics.
-- `GET /api/session`: current Devnet/Mainnet environment, Live/Replay mode, and replay progress.
-- `POST /api/session`: switch environment or run mode. Mainnet is represented as an environment only until a mainnet adapter is configured.
-- `POST /api/replay`: play, pause, reset, seek, or change speed for the selected journal.
-- `GET /api/feed-mode`: configured live-feed availability and current `live`/`inactive` state.
-- `POST /api/feed-mode`: start or stop the real live feeds.
-- `POST /api/kill`: activate the risk kill switch.
-- `POST /api/resume`: clear the risk kill switch.
-
-Control endpoints require `X-Api-Token`. The local default is `local-demo`; set `EDGERUNNER_CONTROL_TOKEN` for any shared deployment.
-The service refuses a non-loopback bind unless `EDGERUNNER_CONTROL_TOKEN` is explicitly set.
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/health` | Service health |
+| `GET /api/ready` | Trading readiness |
+| `GET /api/snapshot` | Current engine state |
+| `GET /api/events` | Server-Sent Events stream |
+| `GET /api/metrics` | Prometheus metrics |
+| `GET /api/session` | Session information |
+| `POST /api/session` | Update session mode |
+| `POST /api/replay` | Replay controls |
+| `GET /api/feed-mode` | Feed status |
+| `POST /api/feed-mode` | Start or stop live feeds |
+| `POST /api/kill` | Activate kill switch |
+| `POST /api/resume` | Resume execution |
+---
 
 ## Verification
 
