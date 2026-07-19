@@ -3,7 +3,10 @@ use std::{fs::File, io::BufRead, io::BufReader, path::Path};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Engine, JournalRecord, MarketDataSource, MarketEvent, MarketMapping, Strategy};
+use crate::{
+    DecisionRecord, Engine, JournalRecord, LatencySnapshot, MarketDataSource, MarketEvent,
+    MarketMapping, Strategy,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplayReport {
@@ -15,6 +18,9 @@ pub struct ReplayReport {
     pub fills: u64,
     pub pnl_micros: i64,
     pub decision_checksum: String,
+    pub replay_compute_latency: LatencySnapshot,
+    #[serde(default, skip_serializing)]
+    pub decision_records: Vec<DecisionRecord>,
 }
 
 pub fn replay<S: Strategy>(
@@ -37,6 +43,7 @@ pub fn replay_with_limit<S: Strategy>(
     let mut active_mapping: Option<MarketMapping> = None;
     let mut decisions = 0;
     let mut fills = 0;
+    let mut decision_records = Vec::new();
     let mut hasher = Sha256::new();
     for (line_number, line) in file.lines().enumerate() {
         let record: JournalRecord = serde_json::from_str(&line?)?;
@@ -73,6 +80,7 @@ pub fn replay_with_limit<S: Strategy>(
                     decisions += 1;
                     fills += u64::from(output.fill.is_some());
                     hasher.update(serde_json::to_vec(&output.decision.intent)?);
+                    decision_records.push(output.decision);
                 }
                 if max_events.is_some_and(|limit| events >= limit) {
                     break;
@@ -101,6 +109,8 @@ pub fn replay_with_limit<S: Strategy>(
         fills,
         pnl_micros: engine.state.pnl_micros,
         decision_checksum: format!("{:x}", hasher.finalize()),
+        replay_compute_latency: engine.latency_snapshot(),
+        decision_records,
     })
 }
 
@@ -228,8 +238,10 @@ mod tests {
         let mut second = make_engine();
         let first_report = replay(&path, &mut first).unwrap();
         let second_report = replay(&path, &mut second).unwrap();
-        assert_eq!(first_report.decisions, 1);
+        assert_eq!(first_report.decisions, 2);
         assert_eq!(first_report.fills, 1);
+        assert_eq!(first_report.decision_records[0].action, "skipped");
+        assert_eq!(first_report.decision_records[1].action, "submitted");
         assert_eq!(
             first_report.decision_checksum,
             second_report.decision_checksum

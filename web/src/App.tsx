@@ -354,11 +354,11 @@ function ActivityPanel({ snapshot, tab, onTab }: { snapshot: Snapshot; tab: "dec
 }
 
 function DecisionTable({ decisions }: { decisions: Decision[] }) {
-  if (decisions.length === 0) return <EmptyPanel title="No decisions yet" detail="The engine is waiting for an executable edge." inline />;
+  if (decisions.length === 0) return <EmptyPanel title="No evaluations yet" detail="The engine is waiting for synchronized market data." inline />;
   return (
     <div className="table-scroll">
       <table>
-        <thead><tr><th>Time</th><th>Action</th><th>Side</th><th>Price</th><th>Qty</th><th>Edge</th><th>Core</th></tr></thead>
+        <thead><tr><th>Time</th><th>Action</th><th>Side</th><th>Price</th><th>Qty</th><th>Net edge</th><th>Compute</th><th>Reason</th></tr></thead>
         <tbody>
           {decisions.slice(0, 10).map((decision) => (
             <tr key={decision.id}>
@@ -368,7 +368,8 @@ function DecisionTable({ decisions }: { decisions: Decision[] }) {
               <td className="font-mono">{formatProbability(decision.intent?.limit_price)}</td>
               <td className="font-mono">{decision.intent?.quantity ?? "-"}</td>
               <td className="font-mono">{decision.intent ? `${(decision.intent.expected_edge_micros / 10_000).toFixed(2)}%` : "-"}</td>
-              <td className="font-mono">{formatLatency(decision.decision_latency_ns)}</td>
+              <td className="font-mono">{formatLatency(decision.compute_latency_ns)}</td>
+              <td className="max-w-64 truncate text-secondary" title={decision.reason}>{decision.reason}</td>
             </tr>
           ))}
         </tbody>
@@ -408,7 +409,7 @@ function LatencyPanel({ snapshot }: { snapshot: Snapshot }) {
   return (
     <section className="panel" aria-labelledby="latency-heading">
       <div className="panel-heading">
-        <div><p className="eyebrow">Hot path</p><h2 id="latency-heading" className="mt-1 text-base font-semibold">Decision latency</h2></div>
+        <div><p className="eyebrow">Hot path</p><h2 id="latency-heading" className="mt-1 text-base font-semibold">Decision compute latency</h2></div>
         <Clock3 size={18} className="text-secondary" aria-hidden="true" />
       </div>
       <div className="space-y-4 p-4 md:p-5">
@@ -418,7 +419,7 @@ function LatencyPanel({ snapshot }: { snapshot: Snapshot }) {
             <div className="latency-track"><span style={{ width: `${Math.max(4, (value / max) * 100)}%` }} /></div>
           </div>
         ))}
-        <p className="border-t border-border pt-3 text-xs text-muted">{snapshot.latency.samples.toLocaleString()} measured decisions</p>
+        <p className="border-t border-border pt-3 text-xs text-muted">{snapshot.latency.samples.toLocaleString()} strategy evaluations</p>
       </div>
     </section>
   );
@@ -475,7 +476,7 @@ function FeedBadge({ status = "disconnected" }: { status?: FeedStatus }) {
 }
 
 function StatusPill({ status }: { status: string }) {
-  const Icon = status === "submitted" ? ArrowUpRight : Ban;
+  const Icon = status === "submitted" ? ArrowUpRight : status === "skipped" ? CircleGauge : Ban;
   return <span className={`status-pill status-${status}`}><Icon size={13} aria-hidden="true" />{status}</span>;
 }
 

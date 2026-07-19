@@ -39,7 +39,7 @@ export interface Decision {
   action: string;
   reason: string;
   intent: OrderIntent | null;
-  decision_latency_ns: number;
+  compute_latency_ns: number;
 }
 
 export interface Fill {

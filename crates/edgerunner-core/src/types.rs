@@ -202,7 +202,8 @@ pub struct DecisionRecord {
     pub action: String,
     pub reason: String,
     pub intent: Option<OrderIntent>,
-    pub decision_latency_ns: u64,
+    #[serde(rename = "compute_latency_ns", alias = "decision_latency_ns")]
+    pub compute_latency_ns: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

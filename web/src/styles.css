@@ -56,6 +56,7 @@ tbody tr:hover { background: var(--color-surface-raised); }
 .status-pill { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
 .status-submitted { color: var(--color-success); }
 .status-rejected { color: var(--color-danger); }
+.status-skipped { color: var(--color-secondary); }
 .feed-badge { display: inline-flex; align-items: center; font-family: var(--font-mono); font-size: 12px; text-transform: uppercase; }
 .feed-live { color: var(--color-success); }
 .feed-stale, .feed-connecting { color: var(--color-warning); }

@@ -6,7 +6,15 @@ use crate::{EventEnvelope, MarketEvent, MarketState, OrderIntent, Side};
 
 pub trait Strategy: Send {
     fn name(&self) -> &'static str;
-    fn on_event(&mut self, state: &MarketState, event: &EventEnvelope) -> Vec<OrderIntent>;
+    fn on_event(&mut self, state: &MarketState, event: &EventEnvelope) -> Vec<StrategyEvaluation>;
+}
+
+#[derive(Clone, Debug)]
+pub struct StrategyEvaluation {
+    /// The candidate order evaluated by the strategy, even if it was not eligible to submit.
+    pub intent: Option<OrderIntent>,
+    pub eligible: bool,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -59,7 +67,7 @@ impl Strategy for DislocationTaker {
         "dislocation_taker"
     }
 
-    fn on_event(&mut self, state: &MarketState, event: &EventEnvelope) -> Vec<OrderIntent> {
+    fn on_event(&mut self, state: &MarketState, event: &EventEnvelope) -> Vec<StrategyEvaluation> {
         if !matches!(
             event.event,
             MarketEvent::FairValue { .. } | MarketEvent::Book { .. }
@@ -74,7 +82,11 @@ impl Strategy for DislocationTaker {
 
         let (Some(fair), Some(bid), Some(ask)) = (state.fair_value, state.best_bid, state.best_ask)
         else {
-            return Vec::new();
+            return vec![StrategyEvaluation {
+                intent: None,
+                eligible: false,
+                reason: "waiting for both fair value and order book".into(),
+            }];
         };
 
         let buy_edge = self.edge_after_costs(fair - ask, ask.micros());
@@ -85,11 +97,7 @@ impl Strategy for DislocationTaker {
             (Side::Ask, bid, sell_edge, state.bid_size)
         };
 
-        if edge < self.config.minimum_edge_micros || visible_size == 0 {
-            return Vec::new();
-        }
-
-        vec![OrderIntent {
+        let intent = OrderIntent {
             id: deterministic_order_id(state, side),
             market: state.market.clone(),
             side,
@@ -99,6 +107,24 @@ impl Strategy for DislocationTaker {
             created_time_ns: event.received_time_ns,
             source_message_id: state.last_message_id.clone(),
             source_proof_ts: state.last_proof_ts,
+        };
+        let (eligible, reason) = if visible_size == 0 {
+            (false, "no visible liquidity at the executable price".into())
+        } else if edge < self.config.minimum_edge_micros {
+            (
+                false,
+                format!(
+                    "net edge {edge} micros is below minimum {} micros",
+                    self.config.minimum_edge_micros
+                ),
+            )
+        } else {
+            (true, "edge survived costs and strategy threshold".into())
+        };
+        vec![StrategyEvaluation {
+            intent: Some(intent),
+            eligible,
+            reason,
         }]
     }
 }
@@ -146,9 +172,10 @@ mod tests {
                 proof_ts: None,
             },
         );
-        let intents = strategy.on_event(&state, &event);
-        assert_eq!(intents.len(), 1);
-        assert_eq!(intents[0].quantity, 10);
+        let evaluations = strategy.on_event(&state, &event);
+        assert_eq!(evaluations.len(), 1);
+        assert!(evaluations[0].eligible);
+        assert_eq!(evaluations[0].intent.as_ref().unwrap().quantity, 10);
 
         state.fair_value = Some(Price::from_micros(585_000).unwrap());
         state.source_seq = 2;
@@ -162,6 +189,9 @@ mod tests {
                 proof_ts: None,
             },
         );
-        assert!(strategy.on_event(&state, &event).is_empty());
+        let evaluations = strategy.on_event(&state, &event);
+        assert_eq!(evaluations.len(), 1);
+        assert!(!evaluations[0].eligible);
+        assert!(evaluations[0].reason.contains("below minimum"));
     }
 }

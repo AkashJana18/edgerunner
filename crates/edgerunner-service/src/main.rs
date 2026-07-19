@@ -116,7 +116,9 @@ fn engine(config: &BackendConfig) -> Engine<DislocationTaker> {
 fn run_replay(journal: PathBuf, config: BackendConfig) -> Result<()> {
     let report = replay(journal, &mut engine(&config))
         .map_err(|error| anyhow::anyhow!("replay failed: {error}"))?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let mut output = serde_json::to_value(&report)?;
+    output["decision_records"] = serde_json::to_value(&report.decision_records)?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 
@@ -135,7 +137,7 @@ fn run_bench(journal: PathBuf, max_events: Option<u64>, config: BackendConfig) -
             "elapsed_ms": elapsed.as_millis(),
             "events_per_second": report.events as f64 / elapsed.as_secs_f64(),
             "replay": report,
-            "decision_latency": engine.latency_snapshot()
+            "replay_compute_latency": engine.latency_snapshot()
         })
     );
     Ok(())

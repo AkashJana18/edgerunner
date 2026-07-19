@@ -108,19 +108,26 @@ impl<S: Strategy> Engine<S> {
             return Vec::new();
         }
         self.mark_to_market();
-        let intents = self.strategy.on_event(&self.state, &event);
-        let mut outputs = Vec::with_capacity(intents.len().max(1));
+        let evaluations = self.strategy.on_event(&self.state, &event);
+        let mut outputs = Vec::with_capacity(evaluations.len().max(1));
 
-        for intent in intents {
-            let (action, reason, fill): (&str, String, Option<Fill>) =
+        for evaluation in evaluations {
+            let market = evaluation
+                .intent
+                .as_ref()
+                .map(|intent| intent.market.clone())
+                .unwrap_or_else(|| self.state.market.clone());
+            let (action, reason, fill): (&str, String, Option<Fill>) = if !evaluation.eligible {
+                ("skipped", evaluation.reason, None)
+            } else if let Some(intent) = evaluation.intent.as_ref() {
                 match self
                     .risk
-                    .evaluate(&intent, &self.state, event.received_time_ns)
+                    .evaluate(intent, &self.state, event.received_time_ns)
                 {
                     RiskDecision::Approved => {
                         let fill = self
                             .venue
-                            .execute(&intent, &self.state, event.received_time_ns);
+                            .execute(intent, &self.state, event.received_time_ns);
                         if let Some(ref fill) = fill {
                             self.apply_fill(fill);
                         }
@@ -130,7 +137,15 @@ impl<S: Strategy> Engine<S> {
                         self.rejected_orders += 1;
                         ("rejected", reason, None)
                     }
-                };
+                }
+            } else {
+                self.rejected_orders += 1;
+                (
+                    "rejected",
+                    "eligible evaluation has no order candidate".into(),
+                    None,
+                )
+            };
 
             let latency_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let _ = self.latency.record(latency_ns.max(1));
@@ -138,11 +153,11 @@ impl<S: Strategy> Engine<S> {
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 event_id: event.id,
-                market: intent.market.clone(),
+                market,
                 action: action.to_owned(),
                 reason,
-                intent: Some(intent),
-                decision_latency_ns: latency_ns,
+                intent: evaluation.intent,
+                compute_latency_ns: latency_ns,
             };
             self.push_decision(decision.clone());
             if let Some(ref fill) = fill {

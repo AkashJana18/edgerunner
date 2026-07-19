@@ -58,6 +58,7 @@ impl TxLineAdapter {
 
     pub async fn stream_odds(self, sender: mpsc::Sender<EventEnvelope>) -> Result<()> {
         let client = data_client(&self.client, &self.config.origin, &self.config.api_token).await?;
+        self.emit_snapshot(&client, &sender).await?;
         let url = format!(
             "{}/api/odds/stream",
             self.config.origin.trim_end_matches('/')
@@ -72,7 +73,6 @@ impl TxLineAdapter {
             .error_for_status()?;
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::with_capacity(16 * 1024);
-        let mut sequence = 0_u64;
 
         while let Some(chunk) = stream.next().await {
             buffer.extend_from_slice(&chunk?);
@@ -90,45 +90,82 @@ impl TxLineAdapter {
                 }
                 let payload: Value =
                     serde_json::from_str(&data).context("invalid TxLINE SSE JSON")?;
-                if !matches_fixture(&payload, self.config.fixture_id) {
-                    continue;
-                }
-                if !matches_selection(&payload, &self.config.selection) {
-                    continue;
-                }
-                if let Some(probability) =
-                    extract_probability(&payload, Some(&self.config.selection))
+                if !matches_fixture(&payload, self.config.fixture_id)
+                    || !matches_selection(&payload, &self.config.selection)
                 {
-                    let message_id =
-                        extract_string(&payload, &["messageId", "MessageId", "message_id"])
-                            .filter(|value| !value.trim().is_empty());
-                    let proof_ts = extract_i64(&payload, &["ts", "Ts"]);
-                    let (Some(message_id), Some(proof_ts)) = (message_id, proof_ts) else {
-                        tracing::warn!(
-                            fixture_id = self.config.fixture_id,
-                            "dropping TxLINE update without message provenance"
-                        );
-                        continue;
-                    };
-                    sequence += 1;
+                    continue;
+                }
+                if let Some(event) = self.fair_value_event(&payload) {
                     sender
-                        .send(EventEnvelope::new(
-                            epoch_ns(),
-                            MarketEvent::FairValue {
-                                market: self.config.market.clone(),
-                                probability,
-                                source_seq: extract_u64(&payload, &["seq", "Seq"])
-                                    .unwrap_or(sequence),
-                                message_id: Some(message_id),
-                                proof_ts: Some(proof_ts),
-                            },
-                        ))
+                        .send(event)
                         .await
                         .context("engine event channel closed")?;
                 }
             }
         }
         bail!("TxLINE odds stream ended")
+    }
+
+    async fn emit_snapshot(
+        &self,
+        client: &reqwest::Client,
+        sender: &mpsc::Sender<EventEnvelope>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/odds/snapshot/{}",
+            self.config.origin.trim_end_matches('/'),
+            self.config.fixture_id
+        );
+        let payload: Value = client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let Some(snapshot) = payload
+            .as_array()
+            .context("TxLINE odds snapshot must be an array")?
+            .iter()
+            .find(|line| {
+                matches_fixture(line, self.config.fixture_id)
+                    && matches_selection(line, &self.config.selection)
+            })
+        else {
+            tracing::warn!(
+                fixture_id = self.config.fixture_id,
+                "TxLINE snapshot has no selected market line; waiting for SSE"
+            );
+            return Ok(());
+        };
+        if let Some(event) = self.fair_value_event(snapshot) {
+            sender
+                .send(event)
+                .await
+                .context("engine event channel closed")?;
+        }
+        Ok(())
+    }
+
+    fn fair_value_event(&self, payload: &Value) -> Option<EventEnvelope> {
+        let probability = extract_probability(payload, Some(&self.config.selection))?;
+        let message_id = extract_string(payload, &["messageId", "MessageId", "message_id"])
+            .filter(|value| !value.trim().is_empty())?;
+        let proof_ts = extract_i64(payload, &["ts", "Ts"])?;
+        let source_seq = u64::try_from(proof_ts).ok()?;
+        let source_time_ns = source_seq.checked_mul(1_000_000);
+        let mut event = EventEnvelope::new(
+            epoch_ns(),
+            MarketEvent::FairValue {
+                market: self.config.market.clone(),
+                probability,
+                source_seq,
+                message_id: Some(message_id),
+                proof_ts: Some(proof_ts),
+            },
+        );
+        event.source_time_ns = source_time_ns;
+        Some(event)
     }
 }
 
@@ -268,7 +305,7 @@ fn extract_probability(value: &Value, selection: Option<&TxLineMarketSelection>)
             .as_str()
             .map(str::to_owned)
             .or_else(|| value.as_number().map(ToString::to_string))?;
-        return Price::from_decimal(&text).ok();
+        return percentage_to_probability(&text);
     }
     for key in [
         "probability",
@@ -288,6 +325,28 @@ fn extract_probability(value: &Value, selection: Option<&TxLineMarketSelection>)
         }
     }
     None
+}
+
+fn percentage_to_probability(value: &str) -> Option<Price> {
+    let value = value.trim();
+    let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || fractional.len() > 4
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let scale = 10_i64.checked_pow(fractional.len() as u32)?;
+    let whole = whole.parse::<i64>().ok()?;
+    let fractional = if fractional.is_empty() {
+        0
+    } else {
+        fractional.parse::<i64>().ok()?
+    };
+    let percentage = whole.checked_mul(scale)?.checked_add(fractional)?;
+    let probability_micros = percentage.checked_mul(10_000)?.checked_div(scale)?;
+    Price::from_micros(probability_micros).ok()
 }
 
 fn matches_selection(value: &Value, selection: &TxLineMarketSelection) -> bool {
@@ -397,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_the_recorded_price_index_from_a_txline_odds_line() {
+    fn converts_txline_pct_to_a_probability_and_selects_the_recorded_price_index() {
         let selection = TxLineMarketSelection {
             super_odds_type: "match_result".into(),
             market_parameters: String::new(),
@@ -408,7 +467,7 @@ mod tests {
         let value = serde_json::json!({
             "SuperOddsType": "match_result",
             "MarketPeriod": "full_time",
-            "Pct": ["0.510", "0.245", "0.245"]
+            "Pct": ["51.000", "24.500", "24.500"]
         });
         assert!(matches_selection(&value, &selection));
         assert_eq!(
@@ -417,6 +476,56 @@ mod tests {
                 .micros(),
             245_000
         );
+    }
+
+    #[test]
+    fn rejects_pct_values_outside_the_probability_range() {
+        assert_eq!(percentage_to_probability("100.000").unwrap(), Price::ONE);
+        assert!(percentage_to_probability("100.001").is_none());
+        assert!(percentage_to_probability("0.12345").is_none());
+    }
+
+    #[test]
+    fn preserves_txline_message_provenance_in_a_fair_value_event() {
+        let adapter = TxLineAdapter::new(TxLineConfig {
+            origin: "https://txline-dev.txodds.com".into(),
+            api_token: "test-token".into(),
+            market: "fixture.market".into(),
+            fixture_id: 42,
+            selection: TxLineMarketSelection {
+                super_odds_type: "1X2_PARTICIPANT_RESULT".into(),
+                market_parameters: String::new(),
+                market_period: String::new(),
+                price_index: 1,
+                price_name: "draw".into(),
+            },
+        })
+        .unwrap();
+        let event = adapter
+            .fair_value_event(&serde_json::json!({
+                "FixtureId": 42,
+                "MessageId": "message-1",
+                "Ts": 1_784_022_342_409_i64,
+                "SuperOddsType": "1X2_PARTICIPANT_RESULT",
+                "Pct": ["40.112", "29.789", "30.093"]
+            }))
+            .unwrap();
+        assert_eq!(event.source_time_ns, Some(1_784_022_342_409_000_000));
+        match event.event {
+            MarketEvent::FairValue {
+                probability,
+                source_seq,
+                message_id,
+                proof_ts,
+                ..
+            } => {
+                assert_eq!(probability.micros(), 297_890);
+                assert_eq!(source_seq, 1_784_022_342_409);
+                assert_eq!(message_id.as_deref(), Some("message-1"));
+                assert_eq!(proof_ts, Some(1_784_022_342_409));
+            }
+            _ => panic!("expected TxLINE fair-value event"),
+        }
     }
 
     #[test]

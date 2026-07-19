@@ -15,5 +15,5 @@ pub use journal::{
 pub use paper::{ExecutionVenue, PaperConfig, PaperVenue};
 pub use replay::{ReplayReport, replay, replay_with_limit};
 pub use risk::{RiskConfig, RiskDecision, RiskEngine};
-pub use strategy::{DislocationConfig, DislocationTaker, Strategy};
+pub use strategy::{DislocationConfig, DislocationTaker, Strategy, StrategyEvaluation};
 pub use types::*;
