@@ -276,6 +276,15 @@ pub struct NextOrderRequirement {
     pub decision_status: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RiskCapacitySnapshot {
+    pub position_limit: i64,
+    pub notional_limit_micros: i64,
+    pub effective_position_limit: u64,
+    pub remaining_contracts: u64,
+    pub limiting_gate: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EngineSnapshot {
     pub run_id: Uuid,
@@ -293,6 +302,8 @@ pub struct EngineSnapshot {
     pub latency: LatencySnapshot,
     #[serde(default)]
     pub next_order_requirement: Option<NextOrderRequirement>,
+    #[serde(default)]
+    pub risk_capacity: RiskCapacitySnapshot,
     pub processed_events: u64,
     pub ignored_events: u64,
     pub rejected_orders: u64,

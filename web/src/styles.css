@@ -35,6 +35,19 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .control-button-resume { background: var(--color-success); color: #0d2115; }
 .secondary-button { border-color: var(--color-border); background: var(--color-surface-raised); color: var(--color-foreground); }
 .secondary-button:hover { border-color: var(--color-muted); }
+.wallet-control { position: relative; }
+.wallet-button { display: inline-flex; min-height: 40px; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--color-border); background: var(--color-background); padding: 8px 12px; color: var(--color-foreground); font-size: 12px; font-weight: 600; transition: background-color 140ms ease, border-color 140ms ease; }
+.wallet-button:hover:not(:disabled), .wallet-button[aria-expanded="true"] { border-color: var(--color-muted); background: var(--color-surface-raised); }
+.wallet-button:disabled { cursor: wait; opacity: 0.7; }
+.wallet-button-connected { min-width: 126px; justify-content: flex-start; }
+.wallet-status-dot { width: 7px; height: 7px; flex: 0 0 auto; background: var(--color-success); }
+.wallet-menu { position: absolute; top: calc(100% + 8px); right: 0; z-index: 30; width: 208px; border: 1px solid var(--color-border); background: var(--color-surface); padding: 4px; box-shadow: 0 12px 32px color-mix(in srgb, var(--color-background) 75%, transparent); }
+.wallet-menu-address { display: flex; min-height: 40px; align-items: center; gap: 8px; border-bottom: 1px solid var(--color-border); padding: 8px 10px; color: var(--color-secondary); font-size: 12px; }
+.wallet-menu button, .wallet-menu a { display: flex; width: 100%; min-height: 40px; align-items: center; gap: 9px; border: 0; background: transparent; padding: 8px 10px; color: var(--color-secondary); font-size: 12px; text-align: left; text-decoration: none; }
+.wallet-menu button:hover, .wallet-menu a:hover { background: var(--color-surface-raised); color: var(--color-foreground); }
+.wallet-menu .wallet-menu-disconnect { border-top: 1px solid var(--color-border); color: var(--color-danger); }
+.wallet-menu-error { margin: 0; border-top: 1px solid var(--color-border); padding: 8px 10px; color: var(--color-danger); font-size: 11px; line-height: 1.45; }
+.wallet-error { position: absolute; top: calc(100% + 8px); right: 0; z-index: 29; width: 240px; margin: 0; border: 1px solid color-mix(in srgb, var(--color-danger) 45%, transparent); background: var(--color-surface); padding: 9px 10px; color: var(--color-danger); font-size: 11px; line-height: 1.45; }
 .feed-toggle { display: grid; min-width: 40px; min-height: 40px; place-items: center; color: var(--color-muted); transition: color 150ms ease; }
 .feed-toggle:hover:not(:disabled) { color: var(--color-foreground); }
 .feed-toggle:disabled { cursor: not-allowed; opacity: 0.45; }

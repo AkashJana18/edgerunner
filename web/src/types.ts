@@ -9,6 +9,25 @@ export type Environment = "devnet" | "mainnet";
 export type RunMode = "live" | "replay";
 export type ReplayStatus = "paused" | "playing" | "complete" | "unavailable";
 
+export interface SolanaPublicKey {
+  toString(): string;
+}
+
+export interface SolanaWalletProvider {
+  isConnected?: boolean;
+  publicKey?: SolanaPublicKey | null;
+  connect(options?: { onlyIfTrusted?: boolean }): Promise<{ publicKey: SolanaPublicKey }>;
+  disconnect(): Promise<void>;
+  on?(event: "connect" | "disconnect" | "accountChanged", listener: (publicKey?: SolanaPublicKey | null) => void): void;
+  removeListener?(event: "connect" | "disconnect" | "accountChanged", listener: (publicKey?: SolanaPublicKey | null) => void): void;
+}
+
+declare global {
+  interface Window {
+    solana?: SolanaWalletProvider;
+  }
+}
+
 export interface MarketState {
   market: string;
   fair_value: number | null;
@@ -91,6 +110,14 @@ export interface NextOrderRequirement {
   decision_status: string;
 }
 
+export interface RiskCapacity {
+  position_limit: number;
+  notional_limit_micros: number;
+  effective_position_limit: number;
+  remaining_contracts: number;
+  limiting_gate: string;
+}
+
 export interface Snapshot {
   run_id: string;
   mode: "simulated" | "live";
@@ -110,6 +137,7 @@ export interface Snapshot {
     max_us: number;
   };
   next_order_requirement?: NextOrderRequirement | null;
+  risk_capacity?: RiskCapacity;
   processed_events: number;
   rejected_orders: number;
   last_update: string;

@@ -225,7 +225,7 @@ mod tests {
                     1_020_000,
                     MarketEvent::FairValue {
                         market: market.clone(),
-                        probability: Price::from_micros(620_000).unwrap(),
+                        probability: Price::from_micros(650_000).unwrap(),
                         source_seq: 1,
                         message_id: Some("message-1".into()),
                         proof_ts: Some(1_020),
@@ -238,9 +238,9 @@ mod tests {
                     1_040_000,
                     MarketEvent::Book {
                         market: market.clone(),
-                        bid: Price::from_micros(605_000).unwrap(),
+                        bid: Price::from_micros(550_000).unwrap(),
                         bid_size: 100,
-                        ask: Price::from_micros(615_000).unwrap(),
+                        ask: Price::from_micros(560_000).unwrap(),
                         ask_size: 100,
                         venue_seq: 2,
                     },
@@ -252,11 +252,39 @@ mod tests {
                     1_060_000,
                     MarketEvent::Book {
                         market: market.clone(),
-                        bid: Price::from_micros(610_000).unwrap(),
+                        bid: Price::from_micros(560_000).unwrap(),
                         bid_size: 100,
-                        ask: Price::from_micros(620_000).unwrap(),
+                        ask: Price::from_micros(570_000).unwrap(),
                         ask_size: 100,
                         venue_seq: 3,
+                    },
+                ),
+            ),
+            (
+                MarketDataSource::Pascal,
+                EventEnvelope::new(
+                    1_080_000,
+                    MarketEvent::Book {
+                        market: market.clone(),
+                        bid: Price::from_micros(635_000).unwrap(),
+                        bid_size: 100,
+                        ask: Price::from_micros(645_000).unwrap(),
+                        ask_size: 100,
+                        venue_seq: 4,
+                    },
+                ),
+            ),
+            (
+                MarketDataSource::Pascal,
+                EventEnvelope::new(
+                    1_100_000,
+                    MarketEvent::Book {
+                        market: market.clone(),
+                        bid: Price::from_micros(640_000).unwrap(),
+                        bid_size: 100,
+                        ask: Price::from_micros(650_000).unwrap(),
+                        ask_size: 100,
+                        venue_seq: 5,
                     },
                 ),
             ),
@@ -281,22 +309,25 @@ mod tests {
         let mut second = make_engine();
         let first_report = replay(&path, &mut first).unwrap();
         let second_report = replay(&path, &mut second).unwrap();
-        assert_eq!(first_report.decisions, 4);
-        assert_eq!(first_report.fills, 2);
-        assert_eq!(first_report.trades, 2);
+        assert_eq!(first_report.decisions, 6);
+        assert_eq!(first_report.fills, 4);
+        assert_eq!(first_report.trades, 4);
         assert_eq!(first_report.decision_records[0].action, "skipped");
         assert_eq!(first_report.decision_records[1].action, "submitted");
-        assert_eq!(first_report.decision_records[2].action, "skipped");
+        assert_eq!(first_report.decision_records[2].action, "submitted");
         assert_eq!(first_report.decision_records[3].action, "submitted");
+        assert_eq!(first_report.decision_records[4].action, "skipped");
+        assert_eq!(first_report.decision_records[5].action, "submitted");
         assert_eq!(
             first_report.trade_records[0].action,
             crate::TradeAction::Buy
         );
         assert_eq!(
-            first_report.trade_records[1].action,
+            first_report.trade_records[3].action,
             crate::TradeAction::Sell
         );
-        assert!(first_report.trade_records[1].realized_pnl_micros > 0);
+        assert_eq!(first_report.trade_records[3].quantity, 75);
+        assert!(first_report.trade_records[3].realized_pnl_micros > 0);
         assert_eq!(
             first_report.decision_checksum,
             second_report.decision_checksum

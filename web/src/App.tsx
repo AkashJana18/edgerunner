@@ -6,8 +6,11 @@ import {
   Ban,
   CircleGauge,
   Clock3,
+  Copy,
   DatabaseZap,
+  ExternalLink,
   FastForward,
+  LogOut,
   Radio,
   Pause,
   Play,
@@ -15,11 +18,13 @@ import {
   RefreshCw,
   ServerCog,
   ShieldCheck,
+  Wallet,
   WalletCards,
   WifiOff,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import type {
   Decision,
   Environment,
@@ -263,21 +268,199 @@ function Header({
               {session.run_mode === "replay" ? "REPLAY" : session.live_available ? feedStatus.toUpperCase() : session.mapping_status.toUpperCase()}
             </span>
           </div>
-
-          <button
-            type="button"
-            className={`control-button ${snapshot.killed ? "control-button-resume" : "control-button-kill"}`}
-            disabled={busy}
-            aria-busy={busy}
-            onClick={() => void onControl(!snapshot.killed)}
-          >
-            {snapshot.killed ? <Play size={16} aria-hidden="true" /> : <Pause size={16} aria-hidden="true" />}
-            {busy ? "Applying" : snapshot.killed ? "Resume" : "Kill engine"}
-          </button>
+          <div className="flex items-center gap-2">
+            <WalletConnect environment={session.environment} />
+            <button
+              type="button"
+              className={`control-button ${snapshot.killed ? "control-button-resume" : "control-button-kill"}`}
+              disabled={busy}
+              aria-busy={busy}
+              onClick={() => void onControl(!snapshot.killed)}
+            >
+              {snapshot.killed ? <Play size={16} aria-hidden="true" /> : <Pause size={16} aria-hidden="true" />}
+              {busy ? "Applying" : snapshot.killed ? "Resume" : "Kill engine"}
+            </button>
+          </div>
         </div>
       </div>
     </header>
   );
+}
+
+function WalletConnect({ environment }: { environment: Environment }) {
+  const [address, setAddress] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [walletError, setWalletError] = useState("");
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const provider = window.solana;
+    if (!provider) return;
+
+    const setConnectedAddress = (publicKey?: { toString(): string } | null) => {
+      const nextAddress = publicKey === null
+        ? null
+        : publicKey?.toString() ?? provider.publicKey?.toString() ?? null;
+      setAddress(nextAddress);
+      if (!nextAddress) setMenuOpen(false);
+    };
+    const clearConnection = () => {
+      setAddress(null);
+      setMenuOpen(false);
+    };
+
+    void provider
+      .connect({ onlyIfTrusted: true })
+      .then(({ publicKey }) => setConnectedAddress(publicKey))
+      .catch(() => undefined);
+    provider.on?.("connect", setConnectedAddress);
+    provider.on?.("accountChanged", setConnectedAddress);
+    provider.on?.("disconnect", clearConnection);
+
+    return () => {
+      provider.removeListener?.("connect", setConnectedAddress);
+      provider.removeListener?.("accountChanged", setConnectedAddress);
+      provider.removeListener?.("disconnect", clearConnection);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const dismissOnOutsideClick = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) setMenuOpen(false);
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMenuOpen(false);
+      triggerRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", dismissOnOutsideClick);
+    document.addEventListener("keydown", dismissOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", dismissOnOutsideClick);
+      document.removeEventListener("keydown", dismissOnEscape);
+    };
+  }, [menuOpen]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      menuRef.current?.querySelector<HTMLElement>("[role='menuitem']")?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [menuOpen]);
+
+  const navigateMenu = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("[role='menuitem']"));
+    if (items.length === 0) return;
+    event.preventDefault();
+    const currentIndex = items.indexOf(document.activeElement as HTMLElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : event.key === "ArrowDown"
+          ? (currentIndex + 1) % items.length
+          : (currentIndex - 1 + items.length) % items.length;
+    items[nextIndex]?.focus();
+  };
+
+  const connect = async () => {
+    const provider = window.solana;
+    setWalletError("");
+    setCopied(false);
+    if (!provider) {
+      setWalletError("No Solana wallet detected. Install Phantom, then reload.");
+      window.open("https://phantom.com/download", "_blank", "noopener,noreferrer");
+      return;
+    }
+    setConnecting(true);
+    try {
+      const { publicKey } = await provider.connect();
+      setAddress(publicKey.toString());
+    } catch (cause) {
+      const rejected = typeof cause === "object" && cause !== null && "code" in cause && cause.code === 4001;
+      if (!rejected) setWalletError("Wallet connection failed. Unlock your wallet and try again.");
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const copyAddress = async () => {
+    if (!address) return;
+    try {
+      await navigator.clipboard.writeText(address);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      setWalletError("Could not copy the wallet address.");
+    }
+  };
+
+  const disconnect = async () => {
+    setWalletError("");
+    try {
+      await window.solana?.disconnect();
+      setAddress(null);
+      setMenuOpen(false);
+    } catch {
+      setWalletError("Could not disconnect the wallet. Try again.");
+    }
+  };
+
+  const explorerUrl = address
+    ? `https://explorer.solana.com/address/${address}${environment === "devnet" ? "?cluster=devnet" : ""}`
+    : "";
+
+  return (
+    <div ref={containerRef} className="wallet-control">
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`wallet-button ${address ? "wallet-button-connected" : ""}`}
+        disabled={connecting}
+        aria-busy={connecting}
+        aria-expanded={address ? menuOpen : undefined}
+        aria-haspopup={address ? "menu" : undefined}
+        onClick={() => address ? setMenuOpen((open) => !open) : void connect()}
+      >
+        {address ? <span className="wallet-status-dot" aria-hidden="true" /> : <Wallet size={15} aria-hidden="true" />}
+        <span className={address ? "font-mono tabular-nums" : ""}>
+          {connecting ? "Connecting…" : address ? truncateAddress(address) : "Connect wallet"}
+        </span>
+      </button>
+
+      {address && menuOpen && (
+        <div ref={menuRef} className="wallet-menu" role="menu" aria-label="Wallet actions" onKeyDown={navigateMenu}>
+          <div className="wallet-menu-address" title={address}>
+            <span className="wallet-status-dot" aria-hidden="true" />
+            <span className="truncate font-mono">{truncateAddress(address, 6)}</span>
+          </div>
+          <button type="button" role="menuitem" onClick={() => void copyAddress()}>
+            <Copy size={14} aria-hidden="true" />{copied ? "Copied" : "Copy address"}
+          </button>
+          <a href={explorerUrl} target="_blank" rel="noreferrer" role="menuitem">
+            <ExternalLink size={14} aria-hidden="true" />View on explorer
+          </a>
+          <button type="button" role="menuitem" className="wallet-menu-disconnect" onClick={() => void disconnect()}>
+            <LogOut size={14} aria-hidden="true" />Disconnect
+          </button>
+          {walletError && <p className="wallet-menu-error" role="alert">{walletError}</p>}
+        </div>
+      )}
+      {walletError && !menuOpen && <p className="wallet-error" role="alert">{walletError}</p>}
+    </div>
+  );
+}
+
+function truncateAddress(address: string, characters = 4) {
+  if (address.length <= characters * 2 + 3) return address;
+  return `${address.slice(0, characters)}...${address.slice(-characters)}`;
 }
 
 function SessionSelector<T extends Environment | RunMode>({
@@ -403,6 +586,7 @@ function StatusStrip({ snapshot, market, session }: { snapshot: Snapshot; market
         : "live source unavailable";
   const opportunity = grossOpportunity(market);
   const orderRequirement = collateralMetric(snapshot.next_order_requirement);
+  const capacity = snapshot.risk_capacity;
   const pnlTone = (market?.pnl_micros ?? 0) < 0 ? "text-danger" : "";
   const metrics = [
     { label: "Fair value", value: formatProbability(market?.fair_value), detail: feedDetail, icon: DatabaseZap, valueTone: "", detailTone: "text-muted" },
@@ -410,7 +594,16 @@ function StatusStrip({ snapshot, market, session }: { snapshot: Snapshot; market
     { label: "Gross edge", value: formatProbability(opportunity.edge), detail: opportunity.detail, icon: Zap, valueTone: opportunity.tone, detailTone: opportunity.tone || "text-muted" },
     { label: "Projected collateral", value: orderRequirement.value, detail: orderRequirement.detail, icon: WalletCards, valueTone: "", detailTone: orderRequirement.tone },
     { label: "Mark-to-market", value: formatMoney(market?.pnl_micros), detail: "simulated P&L", icon: ServerCog, valueTone: pnlTone, detailTone: "text-muted" },
-    { label: "Position", value: `${market?.position ?? 0}`, detail: "contracts", icon: CircleGauge, valueTone: "", detailTone: "text-muted" },
+    {
+      label: "Position",
+      value: `${market?.position ?? 0}`,
+      detail: capacity
+        ? `${capacity.remaining_contracts} remaining · ${capacity.limiting_gate} cap`
+        : "contracts",
+      icon: CircleGauge,
+      valueTone: "",
+      detailTone: capacity?.remaining_contracts === 0 && Math.abs(market?.position ?? 0) > 0 ? "text-success" : "text-muted",
+    },
   ];
   return (
     <section className="grid grid-cols-2 gap-px border border-border bg-border md:grid-cols-3 xl:grid-cols-6" aria-label="Engine status">
@@ -647,11 +840,19 @@ function RiskPanel({ snapshot, market, session }: { snapshot: Snapshot; market?:
   const liveFeeds = Object.values(snapshot.feed_status).every((status) => status === "live");
   const replayHasData = session.run_mode === "replay" && snapshot.processed_events > 0;
   const feedOkay = session.run_mode === "replay" ? replayHasData : liveFeeds;
+  const position = Math.abs(market?.position ?? 0);
+  const effectiveLimit = snapshot.risk_capacity?.effective_position_limit ?? 250;
+  const atCapacity = position > 0 && snapshot.risk_capacity?.remaining_contracts === 0;
+  const capacityGate = snapshot.risk_capacity?.limiting_gate ?? "position";
   const states = [
     { label: "Kill switch", ok: !snapshot.killed, text: snapshot.killed ? "ACTIVE" : "armed" },
     { label: "Feed freshness", ok: feedOkay, text: session.run_mode === "replay" ? (replayHasData ? "recorded" : "waiting") : liveFeeds ? "within limit" : "unavailable" },
     { label: "Market circuit", ok: !market?.danger && !market?.suspended, text: market?.danger || market?.suspended ? "blocked" : "clear" },
-    { label: "Position limit", ok: Math.abs(market?.position ?? 0) < 250, text: `${Math.abs(market?.position ?? 0)} / 250` },
+    {
+      label: "Entry capacity",
+      ok: position <= effectiveLimit,
+      text: `${position} / ${effectiveLimit} · ${atCapacity ? "full" : capacityGate}`,
+    },
   ];
   return (
     <section className="panel" aria-labelledby="risk-heading">

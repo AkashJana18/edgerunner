@@ -93,25 +93,49 @@ impl Strategy for DislocationTaker {
         };
 
         let (kind, side, price, edge, visible_size, quantity) = if state.position > 0 {
-            let edge = self.edge_after_costs(fair - bid, bid.micros());
-            (
-                OrderIntentKind::Exit,
-                Side::Ask,
-                bid,
-                edge,
-                state.bid_size,
-                (state.position as u64).min(state.bid_size),
-            )
+            let entry_edge = self.edge_after_costs(fair - ask, ask.micros());
+            if entry_edge >= ENTRY_EDGE_THRESHOLD_MICROS {
+                (
+                    OrderIntentKind::Entry,
+                    Side::Bid,
+                    ask,
+                    entry_edge,
+                    state.ask_size,
+                    self.config.order_size.min(state.ask_size),
+                )
+            } else {
+                let exit_edge = self.edge_after_costs(fair - bid, bid.micros());
+                (
+                    OrderIntentKind::Exit,
+                    Side::Ask,
+                    bid,
+                    exit_edge,
+                    state.bid_size,
+                    (state.position as u64).min(state.bid_size),
+                )
+            }
         } else if state.position < 0 {
-            let edge = self.edge_after_costs(ask - fair, ask.micros());
-            (
-                OrderIntentKind::Exit,
-                Side::Bid,
-                ask,
-                edge,
-                state.ask_size,
-                state.position.unsigned_abs().min(state.ask_size),
-            )
+            let entry_edge = self.edge_after_costs(bid - fair, bid.micros());
+            if entry_edge >= ENTRY_EDGE_THRESHOLD_MICROS {
+                (
+                    OrderIntentKind::Entry,
+                    Side::Ask,
+                    bid,
+                    entry_edge,
+                    state.bid_size,
+                    self.config.order_size.min(state.bid_size),
+                )
+            } else {
+                let exit_edge = self.edge_after_costs(ask - fair, ask.micros());
+                (
+                    OrderIntentKind::Exit,
+                    Side::Bid,
+                    ask,
+                    exit_edge,
+                    state.ask_size,
+                    state.position.unsigned_abs().min(state.ask_size),
+                )
+            }
         } else {
             let buy_edge = self.edge_after_costs(fair - ask, ask.micros());
             let sell_edge = self.edge_after_costs(bid - fair, bid.micros());
@@ -304,5 +328,43 @@ mod tests {
         assert_eq!(intent.kind, OrderIntentKind::Exit);
         assert_eq!(intent.side, Side::Ask);
         assert_eq!(intent.quantity, 25);
+    }
+
+    #[test]
+    fn scales_open_positions_while_entry_edge_remains_high() {
+        for (position, fair_value, expected_side) in
+            [(25, 650_000, Side::Bid), (-25, 350_000, Side::Ask)]
+        {
+            let mut strategy = DislocationTaker::new(DislocationConfig::default());
+            let state = MarketState {
+                market: "ARG-USA".into(),
+                fair_value: Some(Price::from_micros(fair_value).unwrap()),
+                best_bid: Some(Price::from_micros(420_000).unwrap()),
+                best_ask: Some(Price::from_micros(580_000).unwrap()),
+                bid_size: 100,
+                ask_size: 100,
+                position,
+                source_seq: 1,
+                venue_seq: 1,
+                ..Default::default()
+            };
+            let event = EventEnvelope::new(
+                100,
+                MarketEvent::Book {
+                    market: state.market.clone(),
+                    bid: state.best_bid.unwrap(),
+                    bid_size: state.bid_size,
+                    ask: state.best_ask.unwrap(),
+                    ask_size: state.ask_size,
+                    venue_seq: 1,
+                },
+            );
+            let evaluation = strategy.on_event(&state, &event).pop().unwrap();
+            assert!(evaluation.eligible);
+            let intent = evaluation.intent.unwrap();
+            assert_eq!(intent.kind, OrderIntentKind::Entry);
+            assert_eq!(intent.side, expected_side);
+            assert_eq!(intent.quantity, 25);
+        }
     }
 }
