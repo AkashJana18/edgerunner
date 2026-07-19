@@ -2,6 +2,9 @@ export type FeedStatus = "connecting" | "live" | "stale" | "disconnected";
 export type FeedMode = "inactive" | "live";
 export type MappingStatus = "unavailable" | "discovering" | "ready";
 export type Side = "bid" | "ask";
+export type OrderIntentKind = "entry" | "exit";
+export type TradeAction = "BUY" | "SELL";
+export type PositionStatus = "OPEN" | "CLOSED";
 export type Environment = "devnet" | "mainnet";
 export type RunMode = "live" | "replay";
 export type ReplayStatus = "paused" | "playing" | "complete" | "unavailable";
@@ -29,10 +32,33 @@ export interface MarketState {
 export interface OrderIntent {
   id: string;
   market: string;
+  kind: OrderIntentKind;
   side: Side;
   limit_price: number;
   quantity: number;
   expected_edge_micros: number;
+}
+
+export interface TradeEvent {
+  order_id: string;
+  market: string;
+  kind: OrderIntentKind;
+  action: TradeAction;
+  timestamp: string;
+  price: number;
+  edge_micros: number;
+  quantity: number;
+  realized_pnl_micros: number;
+}
+
+export interface PositionLifecycle {
+  status: PositionStatus;
+  entry_price: number | null;
+  exit_price: number | null;
+  entry_time: string | null;
+  exit_time: string | null;
+  holding_time_ns: number;
+  realized_pnl_micros: number;
 }
 
 export interface Decision {
@@ -55,6 +81,16 @@ export interface Fill {
   acknowledged_time_ns: number;
 }
 
+export interface NextOrderRequirement {
+  side: Side;
+  quantity: number;
+  price: number;
+  collateral_micros: number;
+  fee_micros: number;
+  required_funds_micros: number;
+  decision_status: string;
+}
+
 export interface Snapshot {
   run_id: string;
   mode: "simulated" | "live";
@@ -64,6 +100,8 @@ export interface Snapshot {
   markets: MarketState[];
   decisions: Decision[];
   fills: Fill[];
+  trades: TradeEvent[];
+  position_lifecycle: PositionLifecycle;
   latency: {
     samples: number;
     p50_us: number;
@@ -71,6 +109,7 @@ export interface Snapshot {
     p99_us: number;
     max_us: number;
   };
+  next_order_requirement?: NextOrderRequirement | null;
   processed_events: number;
   rejected_orders: number;
   last_update: string;

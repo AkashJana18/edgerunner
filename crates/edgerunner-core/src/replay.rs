@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     DecisionRecord, Engine, JournalRecord, LatencySnapshot, MarketDataSource, MarketEvent,
-    MarketMapping, Strategy,
+    MarketMapping, Strategy, TradeEvent,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -16,11 +16,15 @@ pub struct ReplayReport {
     pub mappings: u64,
     pub decisions: u64,
     pub fills: u64,
+    pub trades: u64,
     pub pnl_micros: i64,
     pub decision_checksum: String,
+    pub trade_checksum: String,
     pub replay_compute_latency: LatencySnapshot,
     #[serde(default, skip_serializing)]
     pub decision_records: Vec<DecisionRecord>,
+    #[serde(default, skip_serializing)]
+    pub trade_records: Vec<TradeEvent>,
 }
 
 pub fn replay<S: Strategy>(
@@ -43,8 +47,11 @@ pub fn replay_with_limit<S: Strategy>(
     let mut active_mapping: Option<MarketMapping> = None;
     let mut decisions = 0;
     let mut fills = 0;
+    let mut trades = 0;
     let mut decision_records = Vec::new();
-    let mut hasher = Sha256::new();
+    let mut trade_records = Vec::new();
+    let mut decision_hasher = Sha256::new();
+    let mut trade_hasher = Sha256::new();
     for (line_number, line) in file.lines().enumerate() {
         let record: JournalRecord = serde_json::from_str(&line?)?;
         match record {
@@ -79,7 +86,12 @@ pub fn replay_with_limit<S: Strategy>(
                 for output in engine.process(event) {
                     decisions += 1;
                     fills += u64::from(output.fill.is_some());
-                    hasher.update(serde_json::to_vec(&output.decision.intent)?);
+                    decision_hasher.update(serde_json::to_vec(&output.decision.intent)?);
+                    if let Some(trade) = output.trade {
+                        trades += 1;
+                        trade_hasher.update(serde_json::to_vec(&trade)?);
+                        trade_records.push(trade);
+                    }
                     decision_records.push(output.decision);
                 }
                 if max_events.is_some_and(|limit| events >= limit) {
@@ -107,10 +119,13 @@ pub fn replay_with_limit<S: Strategy>(
         mappings,
         decisions,
         fills,
+        trades,
         pnl_micros: engine.state.pnl_micros,
-        decision_checksum: format!("{:x}", hasher.finalize()),
+        decision_checksum: format!("{:x}", decision_hasher.finalize()),
+        trade_checksum: format!("{:x}", trade_hasher.finalize()),
         replay_compute_latency: engine.latency_snapshot(),
         decision_records,
+        trade_records,
     })
 }
 
@@ -209,11 +224,39 @@ mod tests {
                 EventEnvelope::new(
                     1_020_000,
                     MarketEvent::FairValue {
-                        market,
-                        probability: Price::from_micros(610_000).unwrap(),
+                        market: market.clone(),
+                        probability: Price::from_micros(620_000).unwrap(),
                         source_seq: 1,
                         message_id: Some("message-1".into()),
                         proof_ts: Some(1_020),
+                    },
+                ),
+            ),
+            (
+                MarketDataSource::Pascal,
+                EventEnvelope::new(
+                    1_040_000,
+                    MarketEvent::Book {
+                        market: market.clone(),
+                        bid: Price::from_micros(605_000).unwrap(),
+                        bid_size: 100,
+                        ask: Price::from_micros(615_000).unwrap(),
+                        ask_size: 100,
+                        venue_seq: 2,
+                    },
+                ),
+            ),
+            (
+                MarketDataSource::Pascal,
+                EventEnvelope::new(
+                    1_060_000,
+                    MarketEvent::Book {
+                        market: market.clone(),
+                        bid: Price::from_micros(610_000).unwrap(),
+                        bid_size: 100,
+                        ask: Price::from_micros(620_000).unwrap(),
+                        ask_size: 100,
+                        venue_seq: 3,
                     },
                 ),
             ),
@@ -238,14 +281,28 @@ mod tests {
         let mut second = make_engine();
         let first_report = replay(&path, &mut first).unwrap();
         let second_report = replay(&path, &mut second).unwrap();
-        assert_eq!(first_report.decisions, 2);
-        assert_eq!(first_report.fills, 1);
+        assert_eq!(first_report.decisions, 4);
+        assert_eq!(first_report.fills, 2);
+        assert_eq!(first_report.trades, 2);
         assert_eq!(first_report.decision_records[0].action, "skipped");
         assert_eq!(first_report.decision_records[1].action, "submitted");
+        assert_eq!(first_report.decision_records[2].action, "skipped");
+        assert_eq!(first_report.decision_records[3].action, "submitted");
+        assert_eq!(
+            first_report.trade_records[0].action,
+            crate::TradeAction::Buy
+        );
+        assert_eq!(
+            first_report.trade_records[1].action,
+            crate::TradeAction::Sell
+        );
+        assert!(first_report.trade_records[1].realized_pnl_micros > 0);
         assert_eq!(
             first_report.decision_checksum,
             second_report.decision_checksum
         );
+        assert_eq!(first_report.trade_checksum, second_report.trade_checksum);
+        assert_eq!(first_report.trade_records, second_report.trade_records);
         std::fs::remove_file(path).unwrap();
     }
 

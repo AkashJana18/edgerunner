@@ -23,6 +23,17 @@ impl Default for PaperConfig {
     }
 }
 
+impl PaperConfig {
+    pub(crate) fn fee_micros(&self, price_micros: i64, quantity: u64) -> i64 {
+        price_micros
+            .saturating_mul(1_000_000 - price_micros)
+            .saturating_div(1_000_000)
+            .saturating_mul(self.taker_fee_rate_micros)
+            .saturating_div(1_000_000)
+            .saturating_mul(quantity as i64)
+    }
+}
+
 pub struct PaperVenue {
     config: PaperConfig,
 }
@@ -51,13 +62,7 @@ impl ExecutionVenue for PaperVenue {
             return None;
         }
         let quantity = intent.quantity.min(visible);
-        let fee_micros = price
-            .micros()
-            .saturating_mul(1_000_000 - price.micros())
-            .saturating_div(1_000_000)
-            .saturating_mul(self.config.taker_fee_rate_micros)
-            .saturating_div(1_000_000)
-            .saturating_mul(quantity as i64);
+        let fee_micros = self.config.fee_micros(price.micros(), quantity);
         Some(Fill {
             order_id: intent.id,
             market: intent.market.clone(),

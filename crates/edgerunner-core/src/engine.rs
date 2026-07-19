@@ -3,15 +3,16 @@ use std::{
     time::Instant,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     DecisionRecord, EngineSnapshot, EventEnvelope, ExecutionVenue, FeedStatus, Fill,
-    LatencySnapshot, MarketState, OrderMode, PaperConfig, PaperVenue, RiskConfig, RiskDecision,
-    RiskEngine, Strategy,
+    LatencySnapshot, MarketState, NextOrderRequirement, OrderIntent, OrderIntentKind, OrderMode,
+    PaperConfig, PaperVenue, PositionLifecycle, PositionStatus, Price, RiskConfig, RiskDecision,
+    RiskEngine, SCALE, Side, Strategy, TradeAction, TradeEvent,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -38,6 +39,19 @@ impl Default for EngineConfig {
 pub struct EngineOutput {
     pub decision: DecisionRecord,
     pub fill: Option<Fill>,
+    pub trade: Option<TradeEvent>,
+}
+
+#[derive(Clone, Debug)]
+struct ActivePosition {
+    entry_side: Side,
+    entry_price: Price,
+    entry_time_ns: u64,
+    remaining_quantity: u64,
+    remaining_entry_fee_micros: i64,
+    exited_quantity: u64,
+    exit_notional_micros: i64,
+    realized_pnl_micros: i64,
 }
 
 pub struct Engine<S: Strategy> {
@@ -48,11 +62,15 @@ pub struct Engine<S: Strategy> {
     pub rejected_orders: u64,
     pub decisions: VecDeque<DecisionRecord>,
     pub fills: VecDeque<Fill>,
+    pub trades: VecDeque<TradeEvent>,
     strategy: S,
     risk: RiskEngine,
     venue: Box<dyn ExecutionVenue>,
     config: EngineConfig,
     latency: Histogram<u64>,
+    active_position: Option<ActivePosition>,
+    position_lifecycle: PositionLifecycle,
+    last_event_time_ns: u64,
 }
 
 impl<S: Strategy> Engine<S> {
@@ -65,11 +83,15 @@ impl<S: Strategy> Engine<S> {
             rejected_orders: 0,
             decisions: VecDeque::new(),
             fills: VecDeque::new(),
+            trades: VecDeque::new(),
             strategy,
             risk: RiskEngine::new(config.risk.clone()),
             venue: Box::new(PaperVenue::new(config.paper.clone())),
             config,
             latency: Histogram::new_with_bounds(1, 60_000_000, 3).expect("valid histogram bounds"),
+            active_position: None,
+            position_lifecycle: PositionLifecycle::default(),
+            last_event_time_ns: 0,
         }
     }
 
@@ -83,6 +105,15 @@ impl<S: Strategy> Engine<S> {
         killed: bool,
         feed_status: BTreeMap<String, FeedStatus>,
     ) -> EngineSnapshot {
+        let mut position_lifecycle = self.position_lifecycle.clone();
+        if position_lifecycle.status == PositionStatus::Open
+            && let Some(entry_time) = self
+                .active_position
+                .as_ref()
+                .map(|position| position.entry_time_ns)
+        {
+            position_lifecycle.holding_time_ns = self.last_event_time_ns.saturating_sub(entry_time);
+        }
         EngineSnapshot {
             run_id: self.run_id,
             mode: self.config.mode,
@@ -92,12 +123,40 @@ impl<S: Strategy> Engine<S> {
             markets: vec![self.state.clone()],
             decisions: self.decisions.clone(),
             fills: self.fills.clone(),
+            trades: self.trades.clone(),
+            position_lifecycle,
             latency: self.latency_snapshot(),
+            next_order_requirement: self.next_order_requirement(),
             processed_events: self.processed_events,
             ignored_events: self.ignored_events,
             rejected_orders: self.rejected_orders,
             last_update: Utc::now(),
         }
+    }
+
+    fn next_order_requirement(&self) -> Option<NextOrderRequirement> {
+        let decision = self.decisions.front()?;
+        let intent = decision.intent.as_ref()?;
+        let price_micros = intent.limit_price.micros();
+        let collateral_micros = if intent.kind == OrderIntentKind::Exit {
+            0
+        } else {
+            let collateral_per_contract = match intent.side {
+                Side::Bid => price_micros,
+                Side::Ask => SCALE.saturating_sub(price_micros),
+            };
+            collateral_per_contract.saturating_mul(intent.quantity as i64)
+        };
+        let fee_micros = self.config.paper.fee_micros(price_micros, intent.quantity);
+        Some(NextOrderRequirement {
+            side: intent.side,
+            quantity: intent.quantity,
+            price: intent.limit_price,
+            collateral_micros,
+            fee_micros,
+            required_funds_micros: collateral_micros.saturating_add(fee_micros),
+            decision_status: decision.action.clone(),
+        })
     }
 
     pub fn process(&mut self, event: EventEnvelope) -> Vec<EngineOutput> {
@@ -107,6 +166,7 @@ impl<S: Strategy> Engine<S> {
             self.ignored_events += 1;
             return Vec::new();
         }
+        self.last_event_time_ns = event.received_time_ns;
         self.mark_to_market();
         let evaluations = self.strategy.on_event(&self.state, &event);
         let mut outputs = Vec::with_capacity(evaluations.len().max(1));
@@ -117,41 +177,42 @@ impl<S: Strategy> Engine<S> {
                 .as_ref()
                 .map(|intent| intent.market.clone())
                 .unwrap_or_else(|| self.state.market.clone());
-            let (action, reason, fill): (&str, String, Option<Fill>) = if !evaluation.eligible {
-                ("skipped", evaluation.reason, None)
-            } else if let Some(intent) = evaluation.intent.as_ref() {
-                match self
-                    .risk
-                    .evaluate(intent, &self.state, event.received_time_ns)
-                {
-                    RiskDecision::Approved => {
-                        let fill = self
-                            .venue
-                            .execute(intent, &self.state, event.received_time_ns);
-                        if let Some(ref fill) = fill {
-                            self.apply_fill(fill);
+            let strategy_reason = evaluation.reason.clone();
+            let (action, reason, fill, trade): (&str, String, Option<Fill>, Option<TradeEvent>) =
+                if !evaluation.eligible {
+                    ("skipped", evaluation.reason, None, None)
+                } else if let Some(intent) = evaluation.intent.as_ref() {
+                    match self
+                        .risk
+                        .evaluate(intent, &self.state, event.received_time_ns)
+                    {
+                        RiskDecision::Approved => {
+                            let fill =
+                                self.venue
+                                    .execute(intent, &self.state, event.received_time_ns);
+                            let trade = fill.as_ref().map(|fill| self.apply_fill(fill, intent));
+                            ("submitted", strategy_reason, fill, trade)
                         }
-                        ("submitted", "edge survived costs and risk".to_owned(), fill)
+                        RiskDecision::Rejected { reason } => {
+                            self.rejected_orders += 1;
+                            ("rejected", reason, None, None)
+                        }
                     }
-                    RiskDecision::Rejected { reason } => {
-                        self.rejected_orders += 1;
-                        ("rejected", reason, None)
-                    }
-                }
-            } else {
-                self.rejected_orders += 1;
-                (
-                    "rejected",
-                    "eligible evaluation has no order candidate".into(),
-                    None,
-                )
-            };
+                } else {
+                    self.rejected_orders += 1;
+                    (
+                        "rejected",
+                        "eligible evaluation has no order candidate".into(),
+                        None,
+                        None,
+                    )
+                };
 
             let latency_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let _ = self.latency.record(latency_ns.max(1));
             let decision = DecisionRecord {
                 id: Uuid::new_v4(),
-                at: Utc::now(),
+                at: datetime_from_ns(event.received_time_ns),
                 event_id: event.id,
                 market,
                 action: action.to_owned(),
@@ -163,7 +224,14 @@ impl<S: Strategy> Engine<S> {
             if let Some(ref fill) = fill {
                 self.push_fill(fill.clone());
             }
-            outputs.push(EngineOutput { decision, fill });
+            if let Some(ref trade) = trade {
+                self.push_trade(trade.clone());
+            }
+            outputs.push(EngineOutput {
+                decision,
+                fill,
+                trade,
+            });
         }
         outputs
     }
@@ -181,7 +249,8 @@ impl<S: Strategy> Engine<S> {
         }
     }
 
-    fn apply_fill(&mut self, fill: &Fill) {
+    fn apply_fill(&mut self, fill: &Fill, intent: &OrderIntent) -> TradeEvent {
+        let trade = self.track_position(fill, intent);
         let signed_quantity = match fill.side {
             crate::Side::Bid => fill.quantity as i64,
             crate::Side::Ask => -(fill.quantity as i64),
@@ -202,6 +271,102 @@ impl<S: Strategy> Engine<S> {
             .saturating_sub(fill.fee_micros);
         self.state.fees_micros = self.state.fees_micros.saturating_add(fill.fee_micros);
         self.mark_to_market();
+        trade
+    }
+
+    fn track_position(&mut self, fill: &Fill, intent: &OrderIntent) -> TradeEvent {
+        let timestamp = datetime_from_ns(fill.acknowledged_time_ns);
+        let mut realized_pnl_micros = 0;
+        match intent.kind {
+            OrderIntentKind::Entry => {
+                self.active_position = Some(ActivePosition {
+                    entry_side: fill.side,
+                    entry_price: fill.price,
+                    entry_time_ns: fill.acknowledged_time_ns,
+                    remaining_quantity: fill.quantity,
+                    remaining_entry_fee_micros: fill.fee_micros,
+                    exited_quantity: 0,
+                    exit_notional_micros: 0,
+                    realized_pnl_micros: 0,
+                });
+                self.position_lifecycle = PositionLifecycle {
+                    status: PositionStatus::Open,
+                    entry_price: Some(fill.price),
+                    exit_price: None,
+                    entry_time: Some(timestamp),
+                    exit_time: None,
+                    holding_time_ns: 0,
+                    realized_pnl_micros: 0,
+                };
+            }
+            OrderIntentKind::Exit => {
+                if let Some(active) = self.active_position.as_mut() {
+                    let closed_quantity = fill.quantity.min(active.remaining_quantity);
+                    let entry_fee = if closed_quantity == active.remaining_quantity {
+                        active.remaining_entry_fee_micros
+                    } else {
+                        active
+                            .remaining_entry_fee_micros
+                            .saturating_mul(closed_quantity as i64)
+                            .saturating_div(active.remaining_quantity as i64)
+                    };
+                    let gross_pnl = match active.entry_side {
+                        Side::Bid => fill
+                            .price
+                            .micros()
+                            .saturating_sub(active.entry_price.micros()),
+                        Side::Ask => active
+                            .entry_price
+                            .micros()
+                            .saturating_sub(fill.price.micros()),
+                    }
+                    .saturating_mul(closed_quantity as i64);
+                    realized_pnl_micros = gross_pnl
+                        .saturating_sub(entry_fee)
+                        .saturating_sub(fill.fee_micros);
+                    active.remaining_quantity =
+                        active.remaining_quantity.saturating_sub(closed_quantity);
+                    active.remaining_entry_fee_micros =
+                        active.remaining_entry_fee_micros.saturating_sub(entry_fee);
+                    active.exited_quantity = active.exited_quantity.saturating_add(closed_quantity);
+                    active.exit_notional_micros = active
+                        .exit_notional_micros
+                        .saturating_add(fill.price.micros().saturating_mul(closed_quantity as i64));
+                    active.realized_pnl_micros = active
+                        .realized_pnl_micros
+                        .saturating_add(realized_pnl_micros);
+
+                    let exit_price_micros = active
+                        .exit_notional_micros
+                        .saturating_div(active.exited_quantity.max(1) as i64);
+                    self.position_lifecycle.exit_price = Price::from_micros(exit_price_micros).ok();
+                    self.position_lifecycle.exit_time = Some(timestamp);
+                    self.position_lifecycle.holding_time_ns = fill
+                        .acknowledged_time_ns
+                        .saturating_sub(active.entry_time_ns);
+                    self.position_lifecycle.realized_pnl_micros = active.realized_pnl_micros;
+                    if active.remaining_quantity == 0 {
+                        self.position_lifecycle.status = PositionStatus::Closed;
+                        self.active_position = None;
+                    }
+                }
+            }
+        }
+
+        TradeEvent {
+            order_id: fill.order_id,
+            market: fill.market.clone(),
+            kind: intent.kind,
+            action: match fill.side {
+                Side::Bid => TradeAction::Buy,
+                Side::Ask => TradeAction::Sell,
+            },
+            timestamp,
+            price: fill.price,
+            edge_micros: intent.expected_edge_micros,
+            quantity: fill.quantity,
+            realized_pnl_micros,
+        }
     }
 
     fn mark_to_market(&mut self) {
@@ -223,6 +388,17 @@ impl<S: Strategy> Engine<S> {
         self.fills.push_front(fill);
         self.fills.truncate(self.config.decision_history);
     }
+
+    fn push_trade(&mut self, trade: TradeEvent) {
+        self.trades.push_front(trade);
+        self.trades.truncate(self.config.decision_history);
+    }
+}
+
+fn datetime_from_ns(timestamp_ns: u64) -> DateTime<Utc> {
+    let seconds = (timestamp_ns / 1_000_000_000).min(i64::MAX as u64) as i64;
+    let nanos = (timestamp_ns % 1_000_000_000) as u32;
+    DateTime::from_timestamp(seconds, nanos).unwrap_or(DateTime::UNIX_EPOCH)
 }
 
 #[cfg(test)]
@@ -263,6 +439,141 @@ mod tests {
         assert_eq!(engine.state.position, 25);
         assert_eq!(engine.state.ask_size, 75);
         assert!(engine.state.pnl_micros > 0);
+    }
+
+    #[test]
+    fn mean_reversion_exit_closes_position_and_records_realized_pnl() {
+        let mut engine = Engine::new(
+            DislocationTaker::new(DislocationConfig::default()),
+            EngineConfig::default(),
+        );
+        let market = "market-a".to_owned();
+        engine.process(EventEnvelope::new(
+            1_000_000,
+            MarketEvent::Book {
+                market: market.clone(),
+                bid: Price::from_micros(540_000).unwrap(),
+                bid_size: 100,
+                ask: Price::from_micros(550_000).unwrap(),
+                ask_size: 100,
+                venue_seq: 1,
+            },
+        ));
+        let entry = engine.process(EventEnvelope::new(
+            1_020_000,
+            MarketEvent::FairValue {
+                market: market.clone(),
+                probability: Price::from_micros(620_000).unwrap(),
+                source_seq: 1,
+                message_id: Some("message-1".into()),
+                proof_ts: Some(1_020),
+            },
+        ));
+        assert_eq!(entry[0].trade.as_ref().unwrap().action, TradeAction::Buy);
+        assert_eq!(engine.position_lifecycle.status, PositionStatus::Open);
+
+        let exit = engine.process(EventEnvelope::new(
+            1_040_000,
+            MarketEvent::Book {
+                market,
+                bid: Price::from_micros(610_000).unwrap(),
+                bid_size: 100,
+                ask: Price::from_micros(620_000).unwrap(),
+                ask_size: 100,
+                venue_seq: 2,
+            },
+        ));
+        let exit_trade = exit[0].trade.as_ref().unwrap();
+        assert_eq!(exit_trade.action, TradeAction::Sell);
+        assert_eq!(exit_trade.kind, OrderIntentKind::Exit);
+        assert!(exit_trade.realized_pnl_micros > 0);
+        assert_eq!(engine.state.position, 0);
+
+        let lifecycle = engine
+            .snapshot(true, false, BTreeMap::new())
+            .position_lifecycle;
+        assert_eq!(lifecycle.status, PositionStatus::Closed);
+        assert_eq!(lifecycle.entry_price.unwrap().micros(), 550_000);
+        assert_eq!(lifecycle.exit_price.unwrap().micros(), 610_000);
+        assert_eq!(lifecycle.holding_time_ns, 20_000);
+        assert_eq!(
+            lifecycle.realized_pnl_micros,
+            exit_trade.realized_pnl_micros
+        );
+        assert_eq!(lifecycle.realized_pnl_micros, engine.state.pnl_micros);
+    }
+
+    #[test]
+    fn snapshot_projects_buy_and_sell_collateral_including_fees() {
+        let cases = [
+            (800_000, Side::Bid, 666_000, 16_650_000, 5_550),
+            (200_000, Side::Ask, 644_000, 8_900_000, 5_725),
+        ];
+        for (fair_value, side, price, collateral, fee) in cases {
+            let mut engine = Engine::new(
+                DislocationTaker::new(DislocationConfig::default()),
+                EngineConfig::default(),
+            );
+            let market = "market-a".to_owned();
+            engine.process(EventEnvelope::new(
+                1_000_000,
+                MarketEvent::Book {
+                    market: market.clone(),
+                    bid: Price::from_micros(644_000).unwrap(),
+                    bid_size: 100,
+                    ask: Price::from_micros(666_000).unwrap(),
+                    ask_size: 100,
+                    venue_seq: 1,
+                },
+            ));
+            engine.process(EventEnvelope::new(
+                1_020_000,
+                MarketEvent::FairValue {
+                    market,
+                    probability: Price::from_micros(fair_value).unwrap(),
+                    source_seq: 1,
+                    message_id: None,
+                    proof_ts: None,
+                },
+            ));
+
+            let requirement = engine
+                .snapshot(true, false, BTreeMap::new())
+                .next_order_requirement
+                .unwrap();
+            assert_eq!(requirement.side, side);
+            assert_eq!(requirement.quantity, 25);
+            assert_eq!(requirement.price.micros(), price);
+            assert_eq!(requirement.collateral_micros, collateral);
+            assert_eq!(requirement.fee_micros, fee);
+            assert_eq!(requirement.required_funds_micros, collateral + fee);
+            assert_eq!(requirement.decision_status, "submitted");
+        }
+    }
+
+    #[test]
+    fn snapshot_without_an_order_requirement_remains_backward_compatible() {
+        let engine = Engine::new(
+            DislocationTaker::new(DislocationConfig::default()),
+            EngineConfig::default(),
+        );
+        let snapshot = engine.snapshot(true, false, BTreeMap::new());
+        assert!(snapshot.next_order_requirement.is_none());
+
+        let mut serialized = serde_json::to_value(snapshot).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("next_order_requirement");
+        serialized.as_object_mut().unwrap().remove("trades");
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("position_lifecycle");
+        let restored: EngineSnapshot = serde_json::from_value(serialized).unwrap();
+        assert!(restored.next_order_requirement.is_none());
+        assert!(restored.trades.is_empty());
+        assert_eq!(restored.position_lifecycle, PositionLifecycle::default());
     }
 
     #[test]

@@ -111,7 +111,7 @@ impl RiskEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Price, Side};
+    use crate::{OrderIntentKind, Price, Side};
     use proptest::prelude::*;
     use uuid::Uuid;
 
@@ -119,6 +119,7 @@ mod tests {
         OrderIntent {
             id: Uuid::new_v4(),
             market: "m".into(),
+            kind: OrderIntentKind::Entry,
             side: Side::Bid,
             limit_price: Price::from_micros(500_000).unwrap(),
             quantity: 10,

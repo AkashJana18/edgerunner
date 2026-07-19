@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{DecisionRecord, EventEnvelope, Fill};
+use crate::{DecisionRecord, EventEnvelope, Fill, TradeEvent};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +58,10 @@ pub enum JournalRecord {
     Fill {
         schema: u16,
         fill: Fill,
+    },
+    Trade {
+        schema: u16,
+        trade: TradeEvent,
     },
     Proof {
         schema: u16,

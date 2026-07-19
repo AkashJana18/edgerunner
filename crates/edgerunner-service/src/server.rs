@@ -801,6 +801,9 @@ async fn process_market_event(
             if let Some(fill) = output.fill {
                 records.push(JournalRecord::Fill { schema: 2, fill });
             }
+            if let Some(trade) = output.trade {
+                records.push(JournalRecord::Trade { schema: 2, trade });
+            }
         }
         (records, proof_requests, guard.snapshot())
     };

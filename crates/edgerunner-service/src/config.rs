@@ -56,13 +56,12 @@ mod tests {
             r#"
                 decision_history = 25
                 [strategy]
-                minimum_edge_micros = 30000
+                order_size = 40
             "#,
         )
         .unwrap();
         assert_eq!(config.decision_history, 25);
-        assert_eq!(config.strategy.minimum_edge_micros, 30_000);
-        assert_eq!(config.strategy.order_size, 25);
+        assert_eq!(config.strategy.order_size, 40);
         assert_eq!(config.risk.max_position, 250);
     }
 }

@@ -8,7 +8,6 @@ import {
   Clock3,
   DatabaseZap,
   FastForward,
-  Globe2,
   Radio,
   Pause,
   Play,
@@ -16,16 +15,17 @@ import {
   RefreshCw,
   ServerCog,
   ShieldCheck,
+  WalletCards,
   WifiOff,
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import type { ReactNode } from "react";
 import type {
   Decision,
   Environment,
   FeedStatus,
   MarketState,
+  PositionLifecycle,
   RunMode,
   SessionState,
   Snapshot,
@@ -46,7 +46,7 @@ function App() {
   const [session, setSession] = useState<SessionState | null>(null);
   const [sessionBusy, setSessionBusy] = useState(false);
   const [replayBusy, setReplayBusy] = useState(false);
-  const [tab, setTab] = useState<"decisions" | "fills">("decisions");
+  const [tab, setTab] = useState<"decisions" | "trades">("decisions");
   const [history, setHistory] = useState<number[]>([]);
 
   const load = useCallback(async () => {
@@ -195,7 +195,7 @@ function App() {
         )}
         <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1.5fr)_minmax(320px,0.75fr)]">
           <div className="min-w-0 space-y-5">
-            <MarketPanel market={market} display={session.market} history={history} />
+            <MarketPanel market={market} display={session.market} history={history} lifecycle={snapshot.position_lifecycle} />
             <ActivityPanel snapshot={snapshot} tab={tab} onTab={setTab} />
           </div>
           <aside className="min-w-0 space-y-5">
@@ -243,12 +243,14 @@ function Header({
         </div>
         <div className="flex flex-wrap items-center justify-end gap-4">
           <SessionSelector
+            ariaLabel="Environment"
             value={session.environment}
             options={["devnet", "mainnet"]}
             disabled={sessionBusy}
             onChange={(environment) => void onSession({ environment })}
           />
           <SessionSelector
+            ariaLabel="Run mode"
             value={session.run_mode}
             options={["live", "replay"]}
             disabled={sessionBusy}
@@ -279,15 +281,13 @@ function Header({
 }
 
 function SessionSelector<T extends Environment | RunMode>({
-  label,
-  icon,
+  ariaLabel,
   value,
   options,
   disabled,
   onChange,
 }: {
-  label: string;
-  icon: ReactNode;
+  ariaLabel: string;
   value: T;
   options: readonly T[];
   disabled: boolean;
@@ -295,8 +295,7 @@ function SessionSelector<T extends Environment | RunMode>({
 }) {
   return (
     <div className="session-selector">
-      <span className="session-selector-label">{icon}{label}</span>
-      <div className="segmented segmented-compact" role="tablist" aria-label={label}>
+      <div className="segmented segmented-compact" role="tablist" aria-label={ariaLabel}>
         {options.map((option) => (
           <button
             key={option}
@@ -403,32 +402,33 @@ function StatusStrip({ snapshot, market, session }: { snapshot: Snapshot; market
         ? "resolving market"
         : "live source unavailable";
   const opportunity = grossOpportunity(market);
+  const orderRequirement = collateralMetric(snapshot.next_order_requirement);
   const pnlTone = (market?.pnl_micros ?? 0) < 0 ? "text-danger" : "";
   const metrics = [
-    { label: "Fair value", value: formatProbability(market?.fair_value), detail: feedDetail, icon: DatabaseZap, tone: "" },
-    { label: "Best market", value: `${formatProbability(market?.best_bid)} / ${formatProbability(market?.best_ask)}`, detail: "bid / ask", icon: Activity, tone: "" },
-    { label: "Gross edge", value: formatProbability(opportunity.edge), detail: opportunity.detail, icon: Zap, tone: opportunity.tone },
-    { label: "Position", value: `${market?.position ?? 0}`, detail: "contracts", icon: CircleGauge, tone: "" },
-    { label: "Mark-to-market", value: formatMoney(market?.pnl_micros), detail: "simulated P&L", icon: ServerCog, tone: pnlTone },
-    { label: "p99 latency", value: `${snapshot.latency.p99_us} μs`, detail: `${compact(snapshot.latency.samples)} evaluations`, icon: Clock3, tone: "" },
+    { label: "Fair value", value: formatProbability(market?.fair_value), detail: feedDetail, icon: DatabaseZap, valueTone: "", detailTone: "text-muted" },
+    { label: "Best market", value: `${formatProbability(market?.best_bid)} / ${formatProbability(market?.best_ask)}`, detail: "bid / ask", icon: Activity, valueTone: "", detailTone: "text-muted" },
+    { label: "Gross edge", value: formatProbability(opportunity.edge), detail: opportunity.detail, icon: Zap, valueTone: opportunity.tone, detailTone: opportunity.tone || "text-muted" },
+    { label: "Projected collateral", value: orderRequirement.value, detail: orderRequirement.detail, icon: WalletCards, valueTone: "", detailTone: orderRequirement.tone },
+    { label: "Mark-to-market", value: formatMoney(market?.pnl_micros), detail: "simulated P&L", icon: ServerCog, valueTone: pnlTone, detailTone: "text-muted" },
+    { label: "Position", value: `${market?.position ?? 0}`, detail: "contracts", icon: CircleGauge, valueTone: "", detailTone: "text-muted" },
   ];
   return (
     <section className="grid grid-cols-2 gap-px border border-border bg-border md:grid-cols-3 xl:grid-cols-6" aria-label="Engine status">
-      {metrics.map(({ label, value, detail, icon: Icon, tone }) => (
+      {metrics.map(({ label, value, detail, icon: Icon, valueTone, detailTone }) => (
         <div key={label} className="metric-cell">
           <div className="flex items-center justify-between gap-2 text-secondary">
             <span className="text-xs font-medium">{label}</span>
             <Icon size={15} aria-hidden="true" />
           </div>
-          <div className={`mt-3 truncate font-mono text-lg font-semibold tabular-nums ${tone}`}>{value}</div>
-          <div className={`mt-1 truncate text-xs ${tone || "text-muted"}`}>{detail}</div>
+          <div className={`mt-3 truncate font-mono text-lg font-semibold tabular-nums ${valueTone}`}>{value}</div>
+          <div className={`mt-1 truncate text-xs ${detailTone}`}>{detail}</div>
         </div>
       ))}
     </section>
   );
 }
 
-function MarketPanel({ market, display, history }: { market?: MarketState; display: SessionState["market"]; history: number[] }) {
+function MarketPanel({ market, display, history, lifecycle }: { market?: MarketState; display: SessionState["market"]; history: number[]; lifecycle: PositionLifecycle }) {
   if (!market) {
     return <EmptyPanel title="Waiting for a matched market" detail="The service is resolving live TxLINE and Pascal market metadata." />;
   }
@@ -448,6 +448,7 @@ function MarketPanel({ market, display, history }: { market?: MarketState; displ
           <p className="mt-1 text-xs text-muted">{friendlyPeriod(readable.period)}</p>
         </div>
       </div>
+      <PositionLifecycleStrip lifecycle={lifecycle} />
       <div className="grid gap-4 p-4 md:grid-cols-[minmax(0,1fr)_220px] md:p-5">
         <div className="min-w-0">
           <div className="flex items-baseline justify-between gap-3">
@@ -489,6 +490,27 @@ function MarketPanel({ market, display, history }: { market?: MarketState; displ
   );
 }
 
+function PositionLifecycleStrip({ lifecycle }: { lifecycle: PositionLifecycle }) {
+  const realizedTone = lifecycle.realized_pnl_micros < 0 ? "text-danger" : lifecycle.realized_pnl_micros > 0 ? "text-success" : "";
+  const values = [
+    { label: "Position status", value: lifecycle.status, tone: lifecycle.status === "OPEN" ? "text-success" : "text-secondary" },
+    { label: "Entry price", value: formatProbability(lifecycle.entry_price), tone: "" },
+    { label: "Exit price", value: formatProbability(lifecycle.exit_price), tone: "" },
+    { label: "Holding time", value: formatHoldingTime(lifecycle.holding_time_ns), tone: "" },
+    { label: "Realized P&L", value: formatMoney(lifecycle.realized_pnl_micros), tone: realizedTone },
+  ];
+  return (
+    <dl className="grid grid-cols-2 gap-px border-y border-border bg-border sm:grid-cols-3 xl:grid-cols-5" aria-label="Position lifecycle">
+      {values.map(({ label, value, tone }) => (
+        <div key={label} className="bg-surface px-4 py-3 md:px-5">
+          <dt className="text-[11px] text-muted">{label}</dt>
+          <dd className={`mt-1 truncate font-mono text-sm font-semibold tabular-nums ${tone}`}>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
 function humanizeMarketSymbol(symbol: string): NonNullable<SessionState["market"]> {
   const countries: Record<string, string> = {
     ARG: "Argentina",
@@ -523,7 +545,7 @@ function BookRow({ label, price, size, side }: { label: string; price: number | 
   );
 }
 
-function ActivityPanel({ snapshot, tab, onTab }: { snapshot: Snapshot; tab: "decisions" | "fills"; onTab: (tab: "decisions" | "fills") => void }) {
+function ActivityPanel({ snapshot, tab, onTab }: { snapshot: Snapshot; tab: "decisions" | "trades"; onTab: (tab: "decisions" | "trades") => void }) {
   return (
     <section className="panel" aria-labelledby="activity-heading">
       <div className="panel-heading flex-wrap">
@@ -533,10 +555,10 @@ function ActivityPanel({ snapshot, tab, onTab }: { snapshot: Snapshot; tab: "dec
         </div>
         <div className="segmented" role="tablist" aria-label="Activity view">
           <button type="button" role="tab" aria-selected={tab === "decisions"} onClick={() => onTab("decisions")}>Decisions</button>
-          <button type="button" role="tab" aria-selected={tab === "fills"} onClick={() => onTab("fills")}>Fills</button>
+          <button type="button" role="tab" aria-selected={tab === "trades"} onClick={() => onTab("trades")}>Trades</button>
         </div>
       </div>
-      {tab === "decisions" ? <DecisionTable decisions={snapshot.decisions} /> : <FillTable snapshot={snapshot} />}
+      {tab === "decisions" ? <DecisionTable decisions={snapshot.decisions} /> : <TradeTable snapshot={snapshot} />}
     </section>
   );
 }
@@ -566,19 +588,21 @@ function DecisionTable({ decisions }: { decisions: Decision[] }) {
   );
 }
 
-function FillTable({ snapshot }: { snapshot: Snapshot }) {
-  if (snapshot.fills.length === 0) return <EmptyPanel title="No fills yet" detail="Simulated fills appear after an intent crosses visible depth." inline />;
+function TradeTable({ snapshot }: { snapshot: Snapshot }) {
+  if (snapshot.trades.length === 0) return <EmptyPanel title="No trades yet" detail="BUY and SELL events appear when entry or exit orders fill." inline />;
   return (
     <div className="table-scroll">
       <table>
-        <thead><tr><th>Order</th><th>Side</th><th>Price</th><th>Qty</th><th>Fee</th></tr></thead>
-        <tbody>{snapshot.fills.slice(0, 10).map((fill) => (
-          <tr key={fill.order_id}>
-            <td className="font-mono text-muted">{fill.order_id.slice(0, 8)}</td>
-            <td className={fill.side === "bid" ? "text-success" : "text-danger"}>{fill.side.toUpperCase()}</td>
-            <td className="font-mono">{formatProbability(fill.price)}</td>
-            <td className="font-mono">{fill.quantity}</td>
-            <td className="font-mono">${(fill.fee_micros / 1_000_000).toFixed(4)}</td>
+        <thead><tr><th>Time</th><th>Event</th><th>Type</th><th>Price</th><th>Edge</th><th>Qty</th><th>Realized P&amp;L</th></tr></thead>
+        <tbody>{snapshot.trades.slice(0, 10).map((trade) => (
+          <tr key={`${trade.order_id}-${trade.kind}`}>
+            <td className="font-mono">{new Date(trade.timestamp).toLocaleTimeString([], { hour12: false })}</td>
+            <td className={trade.action === "BUY" ? "text-success" : "text-danger"}>{trade.action}</td>
+            <td className="font-mono text-secondary">{trade.kind.toUpperCase()}</td>
+            <td className="font-mono">{formatProbability(trade.price)}</td>
+            <td className="font-mono">{(trade.edge_micros / 10_000).toFixed(2)}%</td>
+            <td className="font-mono">{trade.quantity}</td>
+            <td className={`font-mono ${trade.realized_pnl_micros < 0 ? "text-danger" : trade.realized_pnl_micros > 0 ? "text-success" : "text-muted"}`}>{formatMoney(trade.realized_pnl_micros)}</td>
           </tr>
         ))}</tbody>
       </table>
@@ -731,8 +755,38 @@ function grossOpportunity(market?: MarketState) {
     : { edge: sellEdge, detail: "SELL at best bid", tone: "text-danger" };
 }
 
+function collateralMetric(requirement: Snapshot["next_order_requirement"]) {
+  if (!requirement) return { value: "—", detail: "Waiting for strategy", tone: "text-muted" };
+  const side = requirement.side === "bid" ? "BUY" : "SELL";
+  const status = requirement.decision_status === "rejected"
+    ? "blocked"
+    : requirement.decision_status === "skipped"
+      ? "not actionable"
+      : requirement.decision_status;
+  const tone = requirement.decision_status === "rejected"
+    ? "text-danger"
+    : requirement.decision_status === "submitted"
+      ? "text-success"
+      : "text-muted";
+  return {
+    value: formatMoney(requirement.required_funds_micros),
+    detail: `${side} ${requirement.quantity} · ${status}`,
+    tone,
+  };
+}
+
 function formatLatency(ns: number) {
   return ns < 1_000 ? `${ns} ns` : `${(ns / 1_000).toFixed(1)} us`;
+}
+
+function formatHoldingTime(ns: number) {
+  if (ns <= 0) return "—";
+  const milliseconds = ns / 1_000_000;
+  if (milliseconds < 1_000) return `${milliseconds.toFixed(milliseconds < 10 ? 1 : 0)} ms`;
+  const seconds = milliseconds / 1_000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.floor(seconds % 60)}s`;
 }
 
 function formatMoney(value?: number | null) {

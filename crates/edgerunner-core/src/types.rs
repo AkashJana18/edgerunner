@@ -15,6 +15,29 @@ pub enum Side {
     Ask,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderIntentKind {
+    #[default]
+    Entry,
+    Exit,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TradeAction {
+    Buy,
+    Sell,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PositionStatus {
+    Open,
+    #[default]
+    Closed,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderMode {
@@ -89,6 +112,8 @@ impl EventEnvelope {
 pub struct OrderIntent {
     pub id: Uuid,
     pub market: MarketId,
+    #[serde(default)]
+    pub kind: OrderIntentKind,
     pub side: Side,
     pub limit_price: Price,
     pub quantity: u64,
@@ -107,6 +132,30 @@ pub struct Fill {
     pub quantity: u64,
     pub fee_micros: i64,
     pub acknowledged_time_ns: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TradeEvent {
+    pub order_id: Uuid,
+    pub market: MarketId,
+    pub kind: OrderIntentKind,
+    pub action: TradeAction,
+    pub timestamp: DateTime<Utc>,
+    pub price: Price,
+    pub edge_micros: i64,
+    pub quantity: u64,
+    pub realized_pnl_micros: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PositionLifecycle {
+    pub status: PositionStatus,
+    pub entry_price: Option<Price>,
+    pub exit_price: Option<Price>,
+    pub entry_time: Option<DateTime<Utc>>,
+    pub exit_time: Option<DateTime<Utc>>,
+    pub holding_time_ns: u64,
+    pub realized_pnl_micros: i64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -216,6 +265,17 @@ pub struct LatencySnapshot {
     pub max_us: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NextOrderRequirement {
+    pub side: Side,
+    pub quantity: u64,
+    pub price: Price,
+    pub collateral_micros: i64,
+    pub fee_micros: i64,
+    pub required_funds_micros: i64,
+    pub decision_status: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EngineSnapshot {
     pub run_id: Uuid,
@@ -226,7 +286,13 @@ pub struct EngineSnapshot {
     pub markets: Vec<MarketState>,
     pub decisions: VecDeque<DecisionRecord>,
     pub fills: VecDeque<Fill>,
+    #[serde(default)]
+    pub trades: VecDeque<TradeEvent>,
+    #[serde(default)]
+    pub position_lifecycle: PositionLifecycle,
     pub latency: LatencySnapshot,
+    #[serde(default)]
+    pub next_order_requirement: Option<NextOrderRequirement>,
     pub processed_events: u64,
     pub ignored_events: u64,
     pub rejected_orders: u64,
